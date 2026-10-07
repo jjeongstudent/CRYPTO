@@ -1,0 +1,13 @@
+# secrets
+.env
+*.env
+!.env.example
+
+# bot
+bot/node_modules/
+bot/logs/
+
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/*/31337/

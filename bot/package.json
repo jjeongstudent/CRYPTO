@@ -1,0 +1,28 @@
+{
+  "name": "base-arb-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Atomic cyclic-arbitrage (backrun) bot for Base: Uniswap V2 forks + Aerodrome volatile pools",
+  "scripts": {
+    "start": "tsx src/main.ts run",
+    "scan": "tsx src/main.ts scan",
+    "check": "tsx src/main.ts check",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:e2e": "vitest run test/e2e"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "viem": "^2.57.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}
