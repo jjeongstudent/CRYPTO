@@ -4,10 +4,22 @@ test = "test"
 script = "script"
 out = "out"
 libs = ["lib"]
-solc_version = "0.8.28"
+# Our code pins 0.8.28; the real Uniswap V3 (0.7.6) and V4 (0.8.26) contracts used in tests
+# pin their own versions, so let forge pick the compiler per file.
+auto_detect_solc = true
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 1000000
+# The real Uniswap V3/V4 contracts used in tests exceed EIP-170 at these optimizer settings (Uniswap
+# deploys them with different ones). Test-only: production code is far below the limit.
+code_size_limit = 100000
+remappings = [
+  "forge-std/=lib/forge-std/src/",
+  "v3-core/=lib/v3-core/contracts/",
+  "v4-core/=lib/v4-core/src/",
+  "solmate/=lib/v4-core/lib/solmate/",
+  "@openzeppelin/=lib/v4-core/lib/openzeppelin-contracts/",
+]
 
 [fuzz]
 runs = 2000
