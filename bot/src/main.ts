@@ -1,12 +1,17 @@
 import { existsSync } from "node:fs";
 import { type Address, type PublicClient, createPublicClient, formatEther, getAddress, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { aerodromeFactoryAbi, erc20Abi, v2FactoryAbi } from "./abi.js";
+import { aerodromeFactoryAbi, erc20Abi, executorAbi, v2FactoryAbi } from "./abi.js";
 import { ArbBot, readExecutorRoles } from "./bot.js";
 import { PRESETS } from "./chains.js";
+import { candidateV4Keys, loadV4Pools, slipstreamFactoryAbi, v3FactoryAbi } from "./concentrated.js";
 import { type BotConfig, loadConfig, loadSecrets } from "./config.js";
 import { shortError } from "./engine.js";
+import { ALL_TOPICS } from "./events.js";
 import { log } from "./log.js";
+import { PendingLogsStream } from "./pendingLogs.js";
+import { DEFAULT_V4_KEYS, poolManagerOf } from "./pools.js";
+import type { DexConfig } from "./types.js";
 
 const USAGE = `usage: tsx src/main.ts <check|scan|run>
   check  verify RPC, DEX factories, executor roles and balances
@@ -88,25 +93,26 @@ async function check(cfg: BotConfig, client: PublicClient, operator?: Address): 
   for (const dex of cfg.dexes) {
     const code = await client.getCode({ address: dex.factory });
     const hasCode = !!code && code !== "0x";
-    let pool: Address | undefined;
-    try {
-      pool =
-        dex.kind === "aerodrome"
-          ? await client.readContract({ address: dex.factory, abi: aerodromeFactoryAbi, functionName: "getPool", args: [cfg.baseToken, usdc, false] })
-          : await client.readContract({ address: dex.factory, abi: v2FactoryAbi, functionName: "getPair", args: [cfg.baseToken, usdc] });
-    } catch {
-      pool = undefined;
-    }
-    const hasPool = !!pool && pool !== ZERO_ADDRESS;
+    const pool = hasCode ? await findWethUsdcPool(client, cfg, dex, usdc).catch(() => undefined) : undefined;
     if (!hasCode) missing++;
-    const status = !hasCode ? "FAIL (no contract at factory address)" : hasPool ? "OK" : "WARN (factory found, but no WETH/USDC pool)";
-    console.log(`dex          ${dex.name.padEnd(16)} ${status} factory=${dex.factory}${hasPool ? ` WETH/USDC=${pool}` : ""}`);
+    const status = !hasCode ? "FAIL (no contract at factory address)" : pool ? "OK" : "WARN (contract found, but no WETH/USDC pool)";
+    console.log(`dex          ${dex.name.padEnd(20)} ${status} ${dex.kind === "v4" ? "poolManager" : "factory"}=${dex.factory}${pool ? ` WETH/USDC=${pool}` : ""}`);
   }
+  if (cfg.flashblocksRpcWs) console.log(`flashblocks  ${cfg.flashblocksRpcWs}: ${await probePendingLogs(cfg.flashblocksRpcWs)}`);
+  else if (cfg.flashblocksWs) console.log(`flashblocks  ${cfg.flashblocksWs} (raw stream; logs only if it carries receipts)`);
+  if (cfg.flashblocksRpcWs || cfg.flashblocksWs) console.log(`             simulating against ${cfg.simulatePending ? "pending" : "latest"} state`);
 
   if (cfg.executor) {
     const roles = await readExecutorRoles(client, cfg.executor);
     const balance = await client.readContract({ address: cfg.baseToken, abi: erc20Abi, functionName: "balanceOf", args: [cfg.executor] });
+    const [poolManager, weth] = await Promise.all([
+      client.readContract({ address: cfg.executor, abi: executorAbi, functionName: "poolManager" }),
+      client.readContract({ address: cfg.executor, abi: executorAbi, functionName: "weth" }),
+    ]);
     console.log(`executor     ${cfg.executor} owner=${roles.owner} operator=${roles.operator}`);
+    console.log(`             poolManager=${poolManager} weth=${weth}`);
+    const v4 = poolManagerOf(cfg);
+    if (v4 && poolManager.toLowerCase() !== v4) console.log("             WARN executor's poolManager differs from the configured V4 PoolManager; V4 routes will revert");
     console.log(`inventory    ${formatEther(balance)} WETH in executor`);
   } else {
     console.log("executor     not configured (scan/run will paper-trade with estimated gas)");
@@ -115,6 +121,60 @@ async function check(cfg: BotConfig, client: PublicClient, operator?: Address): 
   console.log(`mode         ${cfg.dryRun ? "DRY-RUN (set DRY_RUN=false to trade)" : "LIVE"}`);
   if (missing > 0) {
     console.log(`\n${missing} factory address(es) have no contract; those DEXes are skipped at runtime. Fix the address or set DISABLE_DEXES.`);
+  }
+}
+
+/** Opens a real pendingLogs subscription and reports whether the endpoint accepts it and streams logs. */
+async function probePendingLogs(url: string): Promise<string> {
+  return new Promise((resolve) => {
+    let subscribed = false;
+    const stream = new PendingLogsStream({
+      url,
+      topics: ALL_TOPICS,
+      batchMs: 1,
+      onBatch: (b) => finish(`OK (subscribed; pool events for pending block ${b.blockNumber} received)`),
+      onStatus: (status, detail) => {
+        if (status === "open") subscribed = true;
+        else if (status === "error" && detail?.includes("rejected")) finish(`FAIL (${detail}); use a Flashblocks-aware RPC`);
+      },
+    });
+    const timer = setTimeout(() => finish(subscribed ? "WARN (subscribed, but no pool events within 10s)" : "FAIL (could not subscribe within 10s)"), 10_000);
+    function finish(result: string) {
+      clearTimeout(timer);
+      stream.stop();
+      resolve(result);
+    }
+    stream.start();
+  });
+}
+
+/** Looks up a WETH/USDC pool on any venue type, to prove the address really is that DEX. */
+async function findWethUsdcPool(client: PublicClient, cfg: BotConfig, dex: DexConfig, usdc: Address): Promise<string | undefined> {
+  const found = (address: Address) => (address !== ZERO_ADDRESS ? address : undefined);
+  switch (dex.kind) {
+    case "v2":
+      return found(await client.readContract({ address: dex.factory, abi: v2FactoryAbi, functionName: "getPair", args: [cfg.baseToken, usdc] }));
+    case "aerodrome":
+      return found(await client.readContract({ address: dex.factory, abi: aerodromeFactoryAbi, functionName: "getPool", args: [cfg.baseToken, usdc, false] }));
+    case "v3":
+    case "pancakeV3":
+      for (const fee of dex.feeTiers ?? [500, 3000]) {
+        const pool = await client.readContract({ address: dex.factory, abi: v3FactoryAbi, functionName: "getPool", args: [cfg.baseToken, usdc, fee] });
+        if (found(pool)) return pool;
+      }
+      return undefined;
+    case "slipstream": {
+      const spacings = await client.readContract({ address: dex.factory, abi: slipstreamFactoryAbi, functionName: "tickSpacings" });
+      for (const spacing of spacings) {
+        const pool = await client.readContract({ address: dex.factory, abi: slipstreamFactoryAbi, functionName: "getPool", args: [cfg.baseToken, usdc, spacing] });
+        if (found(pool)) return pool;
+      }
+      return undefined;
+    }
+    case "v4": {
+      const pools = await loadV4Pools(client, dex, candidateV4Keys([[cfg.weth, usdc]], dex.v4Keys ?? DEFAULT_V4_KEYS, cfg.weth), cfg.weth);
+      return pools[0] ? `pool id ${pools[0].id}` : undefined;
+    }
   }
 }
 

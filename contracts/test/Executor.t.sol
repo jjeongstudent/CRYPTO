@@ -10,6 +10,7 @@ import {MockAeroFactory} from "./mocks/MockAerodrome.sol";
 interface IReserves {
     function getReserves() external view returns (uint256, uint256, uint256);
     function token0() external view returns (address);
+    function token1() external view returns (address);
 }
 
 /// @dev Pretends to be a pool: reports juicy reserves, keeps whatever it is sent, never pays out.
@@ -48,7 +49,7 @@ contract ExecutorTest is Test {
         uni = new MockV2Factory(30);
         pancake = new MockV2Factory(25);
         aero = new MockAeroFactory();
-        executor = new Executor(owner, operator);
+        executor = new Executor(owner, operator, address(0), address(weth));
         weth.mint(address(executor), 50 ether);
     }
 
@@ -77,31 +78,39 @@ contract ExecutorTest is Test {
         _seed(pool, a, amountA, b, amountB);
     }
 
-    function _hop(address pool, uint256 feeBps, address tokenIn) internal view returns (uint256) {
-        bool zeroForOne = IReserves(pool).token0() == tokenIn;
-        return uint256(uint160(pool)) | (feeBps << 160) | ((zeroForOne ? uint256(1) : 0) << 176);
+    function _hop(address pool, uint24 feeBps, address tokenIn) internal view returns (Executor.Hop memory) {
+        address token0 = IReserves(pool).token0();
+        bool zeroForOne = token0 == tokenIn;
+        address tokenOut = zeroForOne ? IReserves(pool).token1() : token0;
+        return Executor.Hop({
+            kind: 0,
+            pool: pool,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: feeBps,
+            tickSpacing: 0,
+            zeroForOne: zeroForOne,
+            flags: 0
+        });
     }
 
     /// @dev Off-chain reference implementation of the route math (what the bot computes).
-    function _quote(uint256 amountIn, uint256[] memory hops) internal view returns (uint256 amount) {
+    function _quote(uint256 amountIn, Executor.Hop[] memory hops) internal view returns (uint256 amount) {
         amount = amountIn;
         for (uint256 i; i < hops.length; ++i) {
-            address pool = address(uint160(hops[i]));
-            uint256 fee = (hops[i] >> 160) & 0xffff;
-            bool zeroForOne = (hops[i] >> 176) & 1 == 1;
-            (uint256 r0, uint256 r1,) = IReserves(pool).getReserves();
-            (uint256 rIn, uint256 rOut) = zeroForOne ? (r0, r1) : (r1, r0);
-            uint256 inWithFee = amount * (10_000 - fee);
+            (uint256 r0, uint256 r1,) = IReserves(hops[i].pool).getReserves();
+            (uint256 rIn, uint256 rOut) = hops[i].zeroForOne ? (r0, r1) : (r1, r0);
+            uint256 inWithFee = amount * (10_000 - hops[i].fee);
             amount = (inWithFee * rOut) / (rIn * 10_000 + inWithFee);
         }
     }
 
-    function _twoHopRoute() internal returns (uint256[] memory hops) {
+    function _twoHopRoute() internal returns (Executor.Hop[] memory hops) {
         // WETH is worth 3000 TKA on "uni" but only 2700 TKA on "pancake":
         // sell WETH on uni, buy it back cheaper on pancake.
         address p1 = _v2Pool(uni, weth, 100 ether, tka, 300_000 ether);
         address p2 = _v2Pool(pancake, weth, 100 ether, tka, 270_000 ether);
-        hops = new uint256[](2);
+        hops = new Executor.Hop[](2);
         hops[0] = _hop(p1, 30, address(weth));
         hops[1] = _hop(p2, 25, address(tka));
     }
@@ -109,7 +118,7 @@ contract ExecutorTest is Test {
     // ------------------------------------------------------------------ tests
 
     function test_twoHopArbitrageCapturesProfit() public {
-        uint256[] memory hops = _twoHopRoute();
+        Executor.Hop[] memory hops = _twoHopRoute();
         uint256 amountIn = 2 ether;
         uint256 expected = _quote(amountIn, hops) - amountIn;
         assertGt(expected, 0);
@@ -127,7 +136,7 @@ contract ExecutorTest is Test {
         address p1 = _v2Pool(uni, weth, 100 ether, tka, 300_000 ether);
         address p2 = _aeroPool(tka, 1_000_000 ether, tkb, 1_100_000e6, 5);
         address p3 = _v2Pool(pancake, tkb, 300_000e6, weth, 100 ether);
-        uint256[] memory hops = new uint256[](3);
+        Executor.Hop[] memory hops = new Executor.Hop[](3);
         hops[0] = _hop(p1, 30, address(weth));
         hops[1] = _hop(p2, 5, address(tka));
         hops[2] = _hop(p3, 25, address(tkb));
@@ -143,7 +152,7 @@ contract ExecutorTest is Test {
     function test_revertsWhenRouteLosesMoney() public {
         address p1 = _v2Pool(uni, weth, 100 ether, tka, 300_000 ether);
         address p2 = _v2Pool(pancake, weth, 100 ether, tka, 300_000 ether);
-        uint256[] memory hops = new uint256[](2);
+        Executor.Hop[] memory hops = new Executor.Hop[](2);
         hops[0] = _hop(p1, 30, address(weth));
         hops[1] = _hop(p2, 25, address(tka));
 
@@ -154,7 +163,7 @@ contract ExecutorTest is Test {
     }
 
     function test_revertsWhenMinProfitNotMet() public {
-        uint256[] memory hops = _twoHopRoute();
+        Executor.Hop[] memory hops = _twoHopRoute();
         uint256 expected = _quote(2 ether, hops) - 2 ether;
 
         vm.prank(operator);
@@ -163,11 +172,11 @@ contract ExecutorTest is Test {
     }
 
     function test_absorbsStateChangeSinceSimulation() public {
-        uint256[] memory hops = _twoHopRoute();
+        Executor.Hop[] memory hops = _twoHopRoute();
         uint256 quotedBefore = _quote(2 ether, hops);
 
         // Someone else trades on the first pool after the bot simulated, shrinking the gap.
-        address p1 = address(uint160(hops[0]));
+        address p1 = hops[0].pool;
         weth.mint(p1, 1 ether);
         (uint256 r0, uint256 r1,) = IReserves(p1).getReserves();
         bool wethIs0 = MockV2Pair(p1).token0() == address(weth);
@@ -185,7 +194,7 @@ contract ExecutorTest is Test {
     }
 
     function test_onlyOperatorCanRun() public {
-        uint256[] memory hops = _twoHopRoute();
+        Executor.Hop[] memory hops = _twoHopRoute();
         vm.expectRevert(Executor.NotOperator.selector);
         executor.run(address(weth), 1 ether, 0, hops);
         vm.prank(owner);
@@ -194,7 +203,9 @@ contract ExecutorTest is Test {
     }
 
     function test_rejectsSingleHopRoute() public {
-        uint256[] memory hops = new uint256[](1);
+        Executor.Hop[] memory hops = new Executor.Hop[](1);
+        hops[0] = _hop(_v2Pool(uni, weth, 100 ether, tka, 300_000 ether), 30, address(weth));
+        hops[0].tokenOut = address(weth); // even a "cycle" of one hop is rejected
         vm.prank(operator);
         vm.expectRevert(Executor.BadRoute.selector);
         executor.run(address(weth), 1 ether, 0, hops);
@@ -204,8 +215,17 @@ contract ExecutorTest is Test {
         // A compromised operator routes all inventory into a pool it controls.
         FakePool fake = new FakePool(address(weth), address(tka));
         address real = _v2Pool(uni, weth, 100 ether, tka, 300_000 ether);
-        uint256[] memory hops = new uint256[](2);
-        hops[0] = uint256(uint160(address(fake))) | (uint256(1) << 176);
+        Executor.Hop[] memory hops = new Executor.Hop[](2);
+        hops[0] = Executor.Hop({
+            kind: 0,
+            pool: address(fake),
+            tokenIn: address(weth),
+            tokenOut: address(tka),
+            fee: 0,
+            tickSpacing: 0,
+            zeroForOne: true,
+            flags: 0
+        });
         hops[1] = _hop(real, 30, address(tka));
 
         vm.prank(operator);
@@ -263,7 +283,7 @@ contract ExecutorTest is Test {
 
         address p1 = _v2Pool(uni, weth, wethA, tka, tkaA);
         address p2;
-        uint256 fee2;
+        uint24 fee2;
         if (viaAero) {
             fee2 = 5;
             p2 = _aeroPool(weth, wethB, tka, tkaB, fee2);
@@ -271,7 +291,7 @@ contract ExecutorTest is Test {
             fee2 = 25;
             p2 = _v2Pool(pancake, weth, wethB, tka, tkaB);
         }
-        uint256[] memory hops = new uint256[](2);
+        Executor.Hop[] memory hops = new Executor.Hop[](2);
         hops[0] = _hop(p1, 30, address(weth));
         hops[1] = _hop(p2, fee2, address(tka));
 
@@ -288,8 +308,8 @@ contract ExecutorTest is Test {
         }
     }
 
-    function _slice(uint256[] memory hops) private pure returns (uint256[] memory first) {
-        first = new uint256[](1);
+    function _slice(Executor.Hop[] memory hops) private pure returns (Executor.Hop[] memory first) {
+        first = new Executor.Hop[](1);
         first[0] = hops[0];
     }
 }

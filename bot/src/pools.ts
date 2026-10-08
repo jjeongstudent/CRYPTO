@@ -1,120 +1,114 @@
-import type { Abi, Address, Log, PublicClient } from "viem";
-import { aerodromeFactoryAbi, erc20Abi, poolAbi, syncAerodromeEvent, syncV2Event, v2FactoryAbi } from "./abi.js";
+import type { Address, Hex, PublicClient } from "viem";
+import { aerodromeFactoryAbi, erc20Abi, poolAbi, v2FactoryAbi } from "./abi.js";
+import { Q96 } from "./clmath.js";
+import {
+  type V4KeyBasic,
+  candidateV4Keys,
+  loadTickWindows,
+  loadV3StylePools,
+  loadV4Pools,
+  refreshV3StylePools,
+  refreshV4Pools,
+  resolveV4Keys,
+  v4PoolId,
+} from "./concentrated.js";
 import type { BotConfig } from "./config.js";
+import { TOPICS } from "./events.js";
 import { log } from "./log.js";
-import type { DexConfig, Pool } from "./types.js";
+import { type ReadCall, getLogs, multiread } from "./rpc.js";
+import type { ClPool, CpPool, DexConfig, Pool } from "./types.js";
 
 const ZERO = "0x0000000000000000000000000000000000000000";
-const MULTICALL_CHUNK = 400;
+/** (fee, tickSpacing) pairs Uniswap's interface creates for hookless V4 pools. */
+export const DEFAULT_V4_KEYS: [number, number][] = [
+  [100, 1],
+  [500, 10],
+  [3000, 60],
+  [10_000, 200],
+];
+const ACTIVITY_TOPICS: Hex[] = [TOPICS.syncV2, TOPICS.syncAerodrome, TOPICS.swapV3, TOPICS.swapPancakeV3, TOPICS.swapV4];
 
 export class PoolRegistry {
-  private readonly pools = new Map<Address, Pool>();
+  private readonly pools = new Map<Hex, Pool>();
 
   add(pool: Pool): void {
-    this.pools.set(pool.address, pool);
+    this.pools.set(pool.id, pool);
   }
 
-  get(address: Address): Pool | undefined {
-    return this.pools.get(address.toLowerCase() as Address);
+  get(id: Hex): Pool | undefined {
+    return this.pools.get(id.toLowerCase() as Hex);
   }
 
-  has(address: Address): boolean {
-    return this.pools.has(address.toLowerCase() as Address);
+  has(id: Hex): boolean {
+    return this.pools.has(id.toLowerCase() as Hex);
   }
 
   get size(): number {
     return this.pools.size;
   }
 
+  get map(): ReadonlyMap<Hex, Pool> {
+    return this.pools;
+  }
+
   all(): Pool[] {
     return [...this.pools.values()];
   }
-
-  /** Returns true when the pool is tracked and its reserves actually changed. */
-  applyReserves(address: Address, reserve0: bigint, reserve1: bigint): boolean {
-    const pool = this.get(address);
-    if (!pool || (pool.reserve0 === reserve0 && pool.reserve1 === reserve1)) return false;
-    pool.reserve0 = reserve0;
-    pool.reserve1 = reserve1;
-    return true;
-  }
 }
 
-interface ReadCall {
-  address: Address;
-  abi: Abi;
-  functionName: string;
-  args?: readonly unknown[];
+export function poolManagerOf(cfg: BotConfig): Address | undefined {
+  return cfg.dexes.find((d) => d.kind === "v4")?.factory;
 }
 
-/** Multicall with per-call failure tolerance; failed calls come back as undefined. */
-export async function multiread<T>(client: PublicClient, calls: ReadCall[]): Promise<(T | undefined)[]> {
-  const out: (T | undefined)[] = [];
-  for (let i = 0; i < calls.length; i += MULTICALL_CHUNK) {
-    const results = (await client.multicall({
-      contracts: calls.slice(i, i + MULTICALL_CHUNK),
-      allowFailure: true,
-      batchSize: 0,
-    } as never)) as { status: "success" | "failure"; result?: unknown }[];
-    for (const r of results) out.push(r.status === "success" ? (r.result as T) : undefined);
-  }
-  return out;
-}
-
-/** eth_getLogs over a range, halving the window whenever the provider rejects it as too large. */
-export async function getSyncLogs(client: PublicClient, fromBlock: bigint, toBlock: bigint, maxWindow = 200n): Promise<Log[]> {
-  const logs: Log[] = [];
-  let start = fromBlock;
-  let window = maxWindow;
-  while (start <= toBlock) {
-    const end = start + window - 1n < toBlock ? start + window - 1n : toBlock;
-    try {
-      const chunk = await client.getLogs({ events: [syncV2Event, syncAerodromeEvent], fromBlock: start, toBlock: end, strict: false });
-      logs.push(...(chunk as Log[]));
-      start = end + 1n;
-    } catch (err) {
-      if (window === 1n) throw err;
-      window = window / 2n;
-    }
-  }
-  return logs;
-}
-
-/** Decodes the two reserve words from a Sync log (identical layout for V2 and Aerodrome). */
-export function decodeSync(logEntry: Log): { reserve0: bigint; reserve1: bigint } | undefined {
-  const data = logEntry.data;
-  if (!data || data.length < 2 + 128) return undefined;
-  return { reserve0: BigInt(`0x${data.slice(2, 66)}`), reserve1: BigInt(`0x${data.slice(66, 130)}`) };
-}
-
-function pairCall(dex: DexConfig, a: Address, b: Address): ReadCall {
-  return dex.kind === "aerodrome"
-    ? { address: dex.factory, abi: aerodromeFactoryAbi, functionName: "getPool", args: [a, b, false] }
-    : { address: dex.factory, abi: v2FactoryAbi, functionName: "getPair", args: [a, b] };
+/** Hub/hub pairs plus every long-tail token against every hub. */
+export function tokenPairs(cfg: BotConfig, tokens: Address[]): [Address, Address][] {
+  const hubs = new Set(cfg.hubs);
+  const pairs: [Address, Address][] = [];
+  for (let i = 0; i < cfg.hubs.length; i++) for (let j = i + 1; j < cfg.hubs.length; j++) pairs.push([cfg.hubs[i]!, cfg.hubs[j]!]);
+  for (const spoke of tokens) if (!hubs.has(spoke)) for (const hub of cfg.hubs) pairs.push([spoke, hub]);
+  return pairs;
 }
 
 /**
- * Finds every pool on the configured DEXes between hub/hub and token/hub pairs, then loads
- * tokens, reserves and fees. Pools that are empty or too shallow in the base token are dropped.
+ * Finds every pool on the configured DEXes for the token set, drops empty or shallow ones, and loads
+ * tick windows for the concentrated ones. `extraV4Keys` adds V4 pools discovered from activity
+ * (non-standard fees or allowed hooks) that probing the default keys would miss.
  */
-export async function loadPools(client: PublicClient, cfg: BotConfig, tokens: Address[]): Promise<Pool[]> {
-  const hubs = new Set(cfg.hubs);
-  const spokes = tokens.filter((t) => !hubs.has(t));
-  const pairs: [Address, Address][] = [];
-  for (let i = 0; i < cfg.hubs.length; i++) for (let j = i + 1; j < cfg.hubs.length; j++) pairs.push([cfg.hubs[i]!, cfg.hubs[j]!]);
-  for (const spoke of spokes) for (const hub of cfg.hubs) pairs.push([spoke, hub]);
+export async function loadPools(client: PublicClient, cfg: BotConfig, tokens: Address[], extraV4Keys: V4KeyBasic[] = []): Promise<Pool[]> {
+  const pairs = tokenPairs(cfg, tokens);
+  const loaded = await Promise.all(
+    cfg.dexes.map(async (dex): Promise<Pool[]> => {
+      try {
+        if (dex.kind === "v2" || dex.kind === "aerodrome") return await loadCpPools(client, dex, pairs);
+        if (dex.kind === "v4") {
+          const keys = [...candidateV4Keys(pairs, dex.v4Keys ?? DEFAULT_V4_KEYS, cfg.weth), ...extraV4Keys];
+          return await loadV4Pools(client, dex, keys, cfg.weth);
+        }
+        return await loadV3StylePools(client, dex, pairs);
+      } catch (err) {
+        log.warn("could not load pools", { dex: dex.name, error: err instanceof Error ? err.message.split("\n")[0] : String(err) });
+        return [];
+      }
+    }),
+  );
+  const pools = loaded.flat().filter((p) => isLiquid(p, cfg));
+  const cl = pools.filter((p): p is ClPool => p.family === "cl");
+  if (cl.length) await loadTickWindows(client, cl, cfg.clRangePct, poolManagerOf(cfg));
+  return pools;
+}
 
-  const lookups = cfg.dexes.flatMap((dex) => pairs.map(([a, b]) => ({ dex, call: pairCall(dex, a, b) })));
-  const found = await multiread<Address>(client, lookups.map((l) => l.call));
-  const poolDex = new Map<Address, DexConfig>();
-  found.forEach((address, i) => {
-    if (address && address !== ZERO) poolDex.set(address.toLowerCase() as Address, lookups[i]!.dex);
-  });
+async function loadCpPools(client: PublicClient, dex: DexConfig, pairs: [Address, Address][]): Promise<CpPool[]> {
+  const lookups: ReadCall[] = pairs.map(([a, b]) =>
+    dex.kind === "aerodrome"
+      ? { address: dex.factory, abi: aerodromeFactoryAbi, functionName: "getPool", args: [a, b, false] }
+      : { address: dex.factory, abi: v2FactoryAbi, functionName: "getPair", args: [a, b] },
+  );
+  const found = await multiread<Address>(client, lookups);
+  const addresses = [...new Set(found.filter((a): a is Address => !!a && a !== ZERO).map((a) => a.toLowerCase() as Address))];
+  if (addresses.length === 0) return [];
 
-  const addresses = [...poolDex.keys()];
   // Aerodrome fees are set per pool by its factory; V2 forks use one fee per factory.
-  const aerodromePools = addresses.filter((a) => poolDex.get(a)!.kind === "aerodrome");
-  const [details, aerodromeFees] = await Promise.all([
+  const [details, fees] = await Promise.all([
     multiread<unknown>(
       client,
       addresses.flatMap((address) => [
@@ -123,97 +117,166 @@ export async function loadPools(client: PublicClient, cfg: BotConfig, tokens: Ad
         { address, abi: poolAbi, functionName: "getReserves" },
       ]),
     ),
-    multiread<bigint>(
-      client,
-      aerodromePools.map((address) => ({
-        address: poolDex.get(address)!.factory,
-        abi: aerodromeFactoryAbi,
-        functionName: "getFee",
-        args: [address, false],
-      })),
-    ),
+    dex.kind === "aerodrome"
+      ? multiread<bigint>(
+          client,
+          addresses.map((address) => ({ address: dex.factory, abi: aerodromeFactoryAbi, functionName: "getFee", args: [address, false] })),
+        )
+      : Promise.resolve(addresses.map(() => BigInt(dex.feeBps ?? 30))),
   ]);
-  const feeOf = new Map(aerodromePools.map((address, i) => [address, aerodromeFees[i]]));
 
-  const pools: Pool[] = [];
+  const pools: CpPool[] = [];
   addresses.forEach((address, i) => {
-    const dex = poolDex.get(address)!;
     const [token0, token1, reserves] = details.slice(i * 3, i * 3 + 3) as [
       Address | undefined,
       Address | undefined,
       readonly [bigint, bigint, bigint] | undefined,
     ];
-    if (!token0 || !token1 || !reserves) return;
-    const fee = dex.kind === "aerodrome" ? feeOf.get(address) : BigInt(dex.feeBps ?? 30);
-    if (fee === undefined || fee >= 10_000n) return;
-    const feeBps = Number(fee);
-    const pool: Pool = {
-      address,
+    const fee = fees[i];
+    if (!token0 || !token1 || !reserves || fee === undefined || fee >= 10_000n) return;
+    pools.push({
+      family: "cp",
+      id: address,
       dex: dex.name,
       kind: dex.kind,
       token0: token0.toLowerCase() as Address,
       token1: token1.toLowerCase() as Address,
-      feeBps,
+      feeBps: Number(fee),
       reserve0: reserves[0],
       reserve1: reserves[1],
-    };
-    if (isLiquid(pool, cfg)) pools.push(pool);
+    });
   });
   return pools;
 }
 
+/** Drops empty pools and pools shallower than `minPoolBaseWei` in the base token. */
 export function isLiquid(pool: Pool, cfg: BotConfig): boolean {
-  if (pool.reserve0 === 0n || pool.reserve1 === 0n) return false;
-  if (pool.token0 === cfg.baseToken) return pool.reserve0 >= cfg.minPoolBaseWei;
-  if (pool.token1 === cfg.baseToken) return pool.reserve1 >= cfg.minPoolBaseWei;
+  let reserve0: bigint;
+  let reserve1: bigint;
+  if (pool.family === "cp") {
+    reserve0 = pool.reserve0;
+    reserve1 = pool.reserve1;
+  } else {
+    // Virtual reserves at the current price: what the pool behaves like for small trades.
+    const { liquidity, sqrtPriceX96 } = pool.state;
+    if (liquidity === 0n || sqrtPriceX96 === 0n) return false;
+    reserve0 = (liquidity * Q96) / sqrtPriceX96;
+    reserve1 = (liquidity * sqrtPriceX96) / Q96;
+  }
+  if (reserve0 === 0n || reserve1 === 0n) return false;
+  if (pool.token0 === cfg.baseToken) return reserve0 >= cfg.minPoolBaseWei;
+  if (pool.token1 === cfg.baseToken) return reserve1 >= cfg.minPoolBaseWei;
   return true;
 }
 
 /**
- * Ranks non-hub tokens by how much their pools traded, given Sync-event counts per pool.
- * Only pools created by a configured factory and paired with a hub count, since those are
- * the only ones the bot can route through.
+ * Re-reads the full state of every tracked pool (reserves, slot0, liquidity, fees, tick windows).
+ * Safety net against missed logs and reorgs. Returns the ids that changed.
  */
-export async function rankActiveTokens(
-  client: PublicClient,
-  cfg: BotConfig,
-  activity: Map<Address, number>,
-): Promise<Map<Address, number>> {
-  const factories = new Set(cfg.dexes.map((d) => d.factory));
-  const hubs = new Set(cfg.hubs);
-  const addresses = [...activity.keys()];
-  const calls: ReadCall[] = addresses.flatMap((address) => [
-    { address, abi: poolAbi, functionName: "factory" },
-    { address, abi: poolAbi, functionName: "token0" },
-    { address, abi: poolAbi, functionName: "token1" },
-  ]);
-  const results = await multiread<Address>(client, calls);
+export async function refreshAll(client: PublicClient, cfg: BotConfig, registry: PoolRegistry): Promise<Set<Hex>> {
+  const pools = registry.all();
+  const cp = pools.filter((p): p is CpPool => p.family === "cp");
+  const cl = pools.filter((p): p is ClPool => p.family === "cl");
+  const v3 = cl.filter((p) => !p.v4);
+  const v4 = cl.filter((p) => p.v4);
+  const poolManager = poolManagerOf(cfg);
 
+  const [reserves, v3Changed, v4Changed] = await Promise.all([
+    multiread<readonly [bigint, bigint, bigint]>(
+      client,
+      cp.map((p) => ({ address: p.id as Address, abi: poolAbi, functionName: "getReserves" })),
+    ),
+    v3.length ? refreshV3StylePools(client, v3) : Promise.resolve(new Set<Hex>()),
+    v4.length && poolManager ? refreshV4Pools(client, poolManager, v4) : Promise.resolve(new Set<Hex>()),
+  ]);
+  const changed = new Set<Hex>([...v3Changed, ...v4Changed]);
+  reserves.forEach((r, i) => {
+    const pool = cp[i]!;
+    if (!r || (pool.reserve0 === r[0] && pool.reserve1 === r[1])) return;
+    pool.reserve0 = r[0];
+    pool.reserve1 = r[1];
+    changed.add(pool.id);
+  });
+  if (cl.length) await loadTickWindows(client, cl, cfg.clRangePct, poolManager);
+  return changed;
+}
+
+/** Counts swap/sync events per pool (address, or V4 pool id) over the last `cfg.discoverBlocks` blocks. */
+export async function recentPoolActivity(client: PublicClient, cfg: BotConfig, head: bigint): Promise<Map<Hex, number>> {
+  const activity = new Map<Hex, number>();
+  if (cfg.discoverBlocks <= 0) return activity;
+  const from = head - BigInt(cfg.discoverBlocks) + 1n;
+  const logs = await getLogs(client, ACTIVITY_TOPICS, from > 0n ? from : 0n, head);
+  const poolManager = poolManagerOf(cfg);
+  for (const entry of logs) countActivity(activity, entry.address, entry.topics, poolManager);
+  log.info("scanned recent pool activity", { blocks: cfg.discoverBlocks, events: logs.length, pools: activity.size });
+  return activity;
+}
+
+export function countActivity(activity: Map<Hex, number>, address: Address, topics: readonly Hex[], poolManager: Address | undefined): void {
+  const topic0 = topics[0];
+  if (!topic0 || !ACTIVITY_TOPICS.includes(topic0)) return;
+  let id: Hex;
+  if (topic0 === TOPICS.swapV4) {
+    if (!poolManager || address.toLowerCase() !== poolManager || !topics[1]) return;
+    id = topics[1].toLowerCase() as Hex;
+  } else {
+    id = address.toLowerCase() as Hex;
+  }
+  activity.set(id, (activity.get(id) ?? 0) + 1);
+}
+
+export interface Ranking {
+  /** Non-hub tokens scored by trading activity of their hub-paired pools. */
+  scores: Map<Address, number>;
+  /** Keys of active V4 pools (resolved through the PositionManager). */
+  v4Keys: V4KeyBasic[];
+}
+
+/**
+ * Ranks long-tail tokens by how much their pools traded. Only pools created by a configured
+ * factory (or V4 pools with allowed hooks) and paired with a hub count, since those are the only
+ * ones the bot can route through.
+ */
+export async function rankActiveTokens(client: PublicClient, cfg: BotConfig, activity: Map<Hex, number>): Promise<Ranking> {
+  const factories = new Set(cfg.dexes.filter((d) => d.kind !== "v4").map((d) => d.factory));
+  const hubs = new Set(cfg.hubs);
   const scores = new Map<Address, number>();
+  const credit = (token0: Address, token1: Address, weight: number) => {
+    const spoke = hubs.has(token0) && !hubs.has(token1) ? token1 : hubs.has(token1) && !hubs.has(token0) ? token0 : undefined;
+    if (spoke) scores.set(spoke, (scores.get(spoke) ?? 0) + weight);
+  };
+
+  const addresses = [...activity.keys()].filter((id) => id.length === 42) as Address[];
+  const results = await multiread<Address>(
+    client,
+    addresses.flatMap((address) => [
+      { address, abi: poolAbi, functionName: "factory" },
+      { address, abi: poolAbi, functionName: "token0" },
+      { address, abi: poolAbi, functionName: "token1" },
+    ]),
+  );
   addresses.forEach((address, i) => {
     const [factory, t0, t1] = results.slice(i * 3, i * 3 + 3);
     if (!factory || !t0 || !t1 || !factories.has(factory.toLowerCase() as Address)) return;
-    const token0 = t0.toLowerCase() as Address;
-    const token1 = t1.toLowerCase() as Address;
-    const spoke = hubs.has(token0) && !hubs.has(token1) ? token1 : hubs.has(token1) && !hubs.has(token0) ? token0 : undefined;
-    if (spoke) scores.set(spoke, (scores.get(spoke) ?? 0) + (activity.get(address) ?? 0));
+    credit(t0.toLowerCase() as Address, t1.toLowerCase() as Address, activity.get(address) ?? 0);
   });
-  return scores;
+
+  const v4Keys: V4KeyBasic[] = [];
+  const v4Dex = cfg.dexes.find((d) => d.kind === "v4");
+  const v4Ids = [...activity.keys()].filter((id) => id.length === 66);
+  if (v4Dex?.positionManager && v4Ids.length) {
+    const resolved = await resolveV4Keys(client, v4Dex.positionManager, v4Ids, new Set(cfg.v4Hooks));
+    const norm = (c: Address) => (c === ZERO ? cfg.weth : c);
+    for (const key of resolved) {
+      v4Keys.push(key);
+      const id = v4PoolId(key);
+      credit(norm(key.currency0), norm(key.currency1), activity.get(id) ?? 0);
+    }
+  }
+  return { scores, v4Keys };
 }
 
-/** Counts Sync events per pool over the last `cfg.discoverBlocks` blocks. */
-export async function recentPoolActivity(client: PublicClient, cfg: BotConfig, head: bigint): Promise<Map<Address, number>> {
-  const activity = new Map<Address, number>();
-  if (cfg.discoverBlocks <= 0) return activity;
-  const from = head - BigInt(cfg.discoverBlocks) + 1n;
-  const logs = await getSyncLogs(client, from > 0n ? from : 0n, head);
-  for (const entry of logs) {
-    const address = entry.address.toLowerCase() as Address;
-    activity.set(address, (activity.get(address) ?? 0) + 1);
-  }
-  log.info("scanned recent pool activity", { blocks: cfg.discoverBlocks, syncEvents: logs.length, pools: activity.size });
-  return activity;
-}
 
 export function topTokens(scores: Map<Address, number>, limit: number, exclude: Set<Address>): Address[] {
   return [...scores.entries()]
@@ -221,20 +284,6 @@ export function topTokens(scores: Map<Address, number>, limit: number, exclude: 
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
     .map(([token]) => token);
-}
-
-/** Re-reads every tracked pool's reserves. Returns the addresses that changed. */
-export async function refreshReserves(client: PublicClient, registry: PoolRegistry): Promise<Set<Address>> {
-  const pools = registry.all();
-  const results = await multiread<readonly [bigint, bigint, bigint]>(
-    client,
-    pools.map((p) => ({ address: p.address, abi: poolAbi, functionName: "getReserves" })),
-  );
-  const changed = new Set<Address>();
-  results.forEach((r, i) => {
-    if (r && registry.applyReserves(pools[i]!.address, r[0], r[1])) changed.add(pools[i]!.address);
-  });
-  return changed;
 }
 
 export async function fetchSymbols(client: PublicClient, tokens: Address[]): Promise<Map<Address, string>> {

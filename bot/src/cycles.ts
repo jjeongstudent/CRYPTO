@@ -1,4 +1,4 @@
-import type { Address } from "viem";
+import type { Address, Hex } from "viem";
 import type { Cycle, Hop, Pool } from "./types.js";
 
 interface Edge {
@@ -27,12 +27,12 @@ export function findCycles(pools: readonly Pool[], base: Address, maxHops: numbe
   const cycles: Cycle[] = [];
   const path: Hop[] = [];
   const seenTokens = new Set<Address>([base]);
-  const usedPools = new Set<Address>();
+  const usedPools = new Set<Hex>();
 
   const walk = (token: Address): void => {
     for (const edge of adjacency.get(token) ?? []) {
       if (cycles.length >= limit) return;
-      if (usedPools.has(edge.pool.address)) continue;
+      if (usedPools.has(edge.pool.id)) continue;
       const hop: Hop = { pool: edge.pool, zeroForOne: edge.zeroForOne };
       if (edge.next === base) {
         if (path.length >= 1) cycles.push({ id: cycles.length, hops: [...path, hop] });
@@ -41,9 +41,9 @@ export function findCycles(pools: readonly Pool[], base: Address, maxHops: numbe
       if (path.length + 1 >= maxHops || seenTokens.has(edge.next)) continue;
       path.push(hop);
       seenTokens.add(edge.next);
-      usedPools.add(edge.pool.address);
+      usedPools.add(edge.pool.id);
       walk(edge.next);
-      usedPools.delete(edge.pool.address);
+      usedPools.delete(edge.pool.id);
       seenTokens.delete(edge.next);
       path.pop();
     }
@@ -54,21 +54,21 @@ export function findCycles(pools: readonly Pool[], base: Address, maxHops: numbe
 
 /** Lets the bot re-check only the cycles touching pools whose reserves just changed. */
 export class CycleIndex {
-  private readonly byPool = new Map<Address, Cycle[]>();
+  private readonly byPool = new Map<Hex, Cycle[]>();
 
   constructor(readonly cycles: Cycle[]) {
     for (const cycle of cycles) {
       for (const hop of cycle.hops) {
-        const list = this.byPool.get(hop.pool.address);
+        const list = this.byPool.get(hop.pool.id);
         if (list) list.push(cycle);
-        else this.byPool.set(hop.pool.address, [cycle]);
+        else this.byPool.set(hop.pool.id, [cycle]);
       }
     }
   }
 
-  affectedBy(changedPools: Iterable<Address>): Cycle[] {
+  affectedBy(changedPools: Iterable<Hex>): Cycle[] {
     const result = new Set<Cycle>();
-    for (const address of changedPools) for (const cycle of this.byPool.get(address) ?? []) result.add(cycle);
+    for (const id of changedPools) for (const cycle of this.byPool.get(id) ?? []) result.add(cycle);
     return [...result];
   }
 }

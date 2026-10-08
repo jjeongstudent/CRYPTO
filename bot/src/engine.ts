@@ -7,6 +7,7 @@ import {
   type Hash,
   type Hex,
   type LocalAccount,
+  type Log,
   type PublicClient,
   encodeFunctionData,
   parseEventLogs,
@@ -15,19 +16,53 @@ import { estimateL1Fee } from "viem/op-stack";
 import { erc20Abi, executorAbi } from "./abi.js";
 import type { BotConfig } from "./config.js";
 import { bigintJson, log } from "./log.js";
-import type { Cycle, Hop, Opportunity } from "./types.js";
+import { type Cycle, type Hop, type Opportunity, hopTokenIn, hopTokenOut } from "./types.js";
 
-const FEE_SHIFT = 160n;
-const DIR_SHIFT = 176n;
 const ZERO_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
 
-/** Packs a hop exactly as Executor.sol decodes it: pool | fee << 160 | zeroForOne << 176. */
-export function encodeHop(hop: Hop): bigint {
-  return BigInt(hop.pool.address) | (BigInt(hop.pool.feeBps) << FEE_SHIFT) | ((hop.zeroForOne ? 1n : 0n) << DIR_SHIFT);
+/** Executor.Hop.kind */
+export const HOP_V2 = 0;
+export const HOP_V3 = 1;
+export const HOP_V4 = 2;
+const FLAG_NATIVE_IN = 1;
+const FLAG_NATIVE_OUT = 2;
+
+export interface EncodedHop {
+  kind: number;
+  pool: Address;
+  tokenIn: Address;
+  tokenOut: Address;
+  fee: number;
+  tickSpacing: number;
+  zeroForOne: boolean;
+  flags: number;
 }
 
-export function encodeRoute(cycle: Cycle): bigint[] {
+/** Builds the Executor.Hop struct for one hop (see contracts/src/Executor.sol for the field meanings). */
+export function encodeHop(hop: Hop): EncodedHop {
+  const pool = hop.pool;
+  const base = { tokenIn: hopTokenIn(hop), tokenOut: hopTokenOut(hop), zeroForOne: hop.zeroForOne };
+  if (pool.family === "cp") return { ...base, kind: HOP_V2, pool: pool.id as Address, fee: pool.feeBps, tickSpacing: 0, flags: 0 };
+  if (!pool.v4) return { ...base, kind: HOP_V3, pool: pool.id as Address, fee: 0, tickSpacing: 0, flags: 0 };
+  // V4: native ETH is routed as WETH and (un)wrapped by the executor around the PoolManager.
+  const [currencyIn, currencyOut] = hop.zeroForOne ? [pool.v4.currency0, pool.v4.currency1] : [pool.v4.currency1, pool.v4.currency0];
+  const flags = (currencyIn === ZERO_ADDRESS ? FLAG_NATIVE_IN : 0) | (currencyOut === ZERO_ADDRESS ? FLAG_NATIVE_OUT : 0);
+  return { ...base, kind: HOP_V4, pool: pool.v4.hooks, fee: pool.v4.fee, tickSpacing: pool.v4.tickSpacing, flags };
+}
+
+export function encodeRoute(cycle: Cycle): EncodedHop[] {
   return cycle.hops.map(encodeHop);
+}
+
+/** Rough gas per hop kind, for paper trading and as a starting point before simulation. */
+export function estimateRouteGas(cycle: Cycle, gasBase: bigint, gasPerHop: bigint): bigint {
+  let gas = gasBase;
+  for (const hop of cycle.hops) {
+    if (hop.pool.family === "cp") gas += gasPerHop;
+    else if (hop.pool.v4) gas += gasPerHop * 2n;
+    else gas += (gasPerHop * 3n) / 2n;
+  }
+  return gas;
 }
 
 export function encodeRun(baseToken: Address, amountIn: bigint, minProfit: bigint, cycle: Cycle): Hex {
@@ -106,6 +141,14 @@ export class ExecutionEngine {
     private readonly account: LocalAccount | undefined,
   ) {}
 
+  /**
+   * With Flashblocks, state is ahead of the latest sealed block; a Flashblocks-aware RPC exposes
+   * that pre-confirmed state as "pending", which is what trades must be simulated against.
+   */
+  private get blockTag(): "pending" | "latest" {
+    return this.cfg.simulatePending ? "pending" : "latest";
+  }
+
   get canSimulate(): boolean {
     return this.cfg.executor !== undefined && this.from !== undefined;
   }
@@ -120,8 +163,8 @@ export class ExecutionEngine {
     const args = [this.cfg.baseToken, opp.amountIn, 0n, encodeRoute(opp.cycle)] as const;
     try {
       const [sim, gas] = await Promise.all([
-        this.client.simulateContract({ address: executor, abi: executorAbi, functionName: "run", args, account: this.from }),
-        this.client.estimateContractGas({ address: executor, abi: executorAbi, functionName: "run", args, account: this.from }),
+        this.client.simulateContract({ address: executor, abi: executorAbi, functionName: "run", args, account: this.from, blockTag: this.blockTag }),
+        this.client.estimateContractGas({ address: executor, abi: executorAbi, functionName: "run", args, account: this.from, blockTag: this.blockTag }),
       ]);
       return { ok: true, profit: sim.result, gas };
     } catch (err) {
@@ -175,16 +218,7 @@ export class ExecutionEngine {
       const l1Fee = (receipt as { l1Fee?: bigint | null }).l1Fee ?? 0n;
       record.realizedFees = receipt.gasUsed * receipt.effectiveGasPrice + l1Fee;
       record.status = receipt.status;
-      let profit = 0n;
-      if (receipt.status === "success") {
-        const executor = this.cfg.executor;
-        for (const ev of parseEventLogs({ abi: erc20Abi, eventName: "Transfer", logs: receipt.logs })) {
-          if (ev.address.toLowerCase() !== this.cfg.baseToken) continue;
-          if (ev.args.to.toLowerCase() === executor) profit += ev.args.value;
-          if (ev.args.from.toLowerCase() === executor) profit -= ev.args.value;
-        }
-      }
-      record.realizedProfit = profit;
+      record.realizedProfit = receipt.status === "success" ? baseTokenFlow(receipt.logs, this.cfg.baseToken, this.cfg.executor) : 0n;
     } catch (err) {
       record.status = "dropped";
       log.warn("no receipt for trade", { hash: record.hash, error: shortError(err) });
@@ -196,6 +230,27 @@ export class ExecutionEngine {
     await mkdir(dirname(this.cfg.tradeLog), { recursive: true });
     await appendFile(this.cfg.tradeLog, JSON.stringify({ time: new Date().toISOString(), ...record }, bigintJson) + "\n");
   }
+}
+
+/**
+ * Net base-token flow into `holder` from a receipt's logs. WETH9 wraps and unwraps emit Deposit /
+ * Withdrawal rather than Transfer, and V4 native-ETH hops wrap and unwrap inside the route, so both
+ * are counted alongside transfers.
+ */
+export function baseTokenFlow(logs: readonly Log[], token: Address, holder: Address): bigint {
+  let flow = 0n;
+  for (const ev of parseEventLogs({ abi: erc20Abi, logs: logs as Log[] })) {
+    if (ev.address.toLowerCase() !== token) continue;
+    if (ev.eventName === "Transfer") {
+      if (ev.args.to.toLowerCase() === holder) flow += ev.args.value;
+      if (ev.args.from.toLowerCase() === holder) flow -= ev.args.value;
+    } else if (ev.eventName === "Deposit") {
+      if (ev.args.dst.toLowerCase() === holder) flow += ev.args.wad;
+    } else if (ev.eventName === "Withdrawal") {
+      if (ev.args.src.toLowerCase() === holder) flow -= ev.args.wad;
+    }
+  }
+  return flow;
 }
 
 export function revertReason(err: unknown): string {

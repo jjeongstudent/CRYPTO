@@ -134,6 +134,7 @@ describe.skipIf(!anvilAvailable)("e2e on anvil", () => {
       chain,
       opStack: false,
       baseToken: weth.toLowerCase() as Address,
+      weth: weth.toLowerCase() as Address,
       hubs: [weth, usdc].map((a) => a.toLowerCase() as Address),
       extraTokens: [],
       dexes: [
@@ -156,12 +157,16 @@ describe.skipIf(!anvilAvailable)("e2e on anvil", () => {
       gasBase: 60_000n,
       gasPerHop: 75_000n,
       tradeLog,
+      clRangePct: 0.25,
+      v4Hooks: [],
+      simulatePending: false,
+      skipSimulation: false,
       ...overrides,
     };
   }
 
   beforeAll(async () => {
-    anvil = spawn(ANVIL, ["--port", String(PORT), "--silent", "--base-fee", "1000000"], { stdio: "ignore" });
+    anvil = spawn(ANVIL, ["--port", String(PORT), "--silent", "--base-fee", "1000000", "--disable-code-size-limit"], { stdio: "ignore" });
     client = createPublicClient({ chain, transport: http(RPC), pollingInterval: 50 }) as PublicClient;
     for (let i = 0; ; i++) {
       try {
@@ -188,7 +193,8 @@ describe.skipIf(!anvilAvailable)("e2e on anvil", () => {
     pools.uniWethToshi = await v2Pool(uni, weth, parseEther("20"), toshi, parseEther("20000000"));
     pools.aeroToshiUsdc = await aeroPool(toshi, parseEther("20000000"), usdc, parseUnits("60000", 6), 30);
 
-    executor = await deploy(A.executor, [owner.address, operator.address]);
+    // No V4 PoolManager in this market: V4 hops disabled.
+    executor = await deploy(A.executor, [owner.address, operator.address, "0x0000000000000000000000000000000000000000", weth]);
     await write(weth, A.erc20.abi, "mint", [executor, parseEther("10")]);
     await test.setBalance({ address: operator.address, value: parseEther("1") });
     rmSync(tradeLog, { force: true });

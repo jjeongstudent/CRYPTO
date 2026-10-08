@@ -1,21 +1,18 @@
-import type { Address } from "viem";
-import { type HopReserves, bestTrade } from "./math.js";
-import type { Cycle, Hop, Opportunity } from "./types.js";
-
-export function hopReserves(hop: Hop): HopReserves {
-  const { pool } = hop;
-  return hop.zeroForOne
-    ? { reserveIn: pool.reserve0, reserveOut: pool.reserve1, feeBps: pool.feeBps }
-    : { reserveIn: pool.reserve1, reserveOut: pool.reserve0, feeBps: pool.feeBps };
-}
+import type { Hex } from "viem";
+import { bestRouteTrade, routeMarginalRate } from "./quote.js";
+import type { Cycle, Opportunity } from "./types.js";
 
 export function evaluateCycle(cycle: Cycle, maxIn: bigint): Opportunity | null {
-  const trade = bestTrade(cycle.hops.map(hopReserves), maxIn);
+  const trade = bestRouteTrade(cycle.hops, maxIn);
   if (!trade) return null;
   return { cycle, amountIn: trade.amountIn, amountOut: trade.amountOut, grossProfit: trade.profit };
 }
 
-/** Evaluates cycles and returns the profitable ones, best first. */
+/**
+ * Evaluates cycles and returns the profitable ones, best first. A float check of the route's
+ * marginal price (does an infinitesimal trade gain anything?) rejects the vast majority of
+ * cycles before any exact bigint math runs.
+ */
 export function findOpportunities(
   cycles: Iterable<Cycle>,
   maxIn: bigint,
@@ -25,6 +22,7 @@ export function findOpportunities(
   const found: Opportunity[] = [];
   for (const cycle of cycles) {
     if (skip?.(cycle)) continue;
+    if (!(routeMarginalRate(cycle.hops) > 1)) continue;
     const opp = evaluateCycle(cycle, maxIn);
     if (opp && opp.grossProfit > minGrossProfit) found.push(opp);
   }
@@ -35,13 +33,13 @@ export function findOpportunities(
  * Greedy pick of the best opportunities that share no pool with each other (or with `busy`).
  * Two trades through the same pool would invalidate each other's quotes.
  */
-export function selectNonOverlapping(opps: readonly Opportunity[], limit: number, busy: ReadonlySet<Address> = new Set()): Opportunity[] {
-  const used = new Set<Address>(busy);
+export function selectNonOverlapping(opps: readonly Opportunity[], limit: number, busy: ReadonlySet<Hex> = new Set()): Opportunity[] {
+  const used = new Set<Hex>(busy);
   const chosen: Opportunity[] = [];
   for (const opp of opps) {
     if (chosen.length >= limit) break;
-    if (opp.cycle.hops.some((h) => used.has(h.pool.address))) continue;
-    for (const h of opp.cycle.hops) used.add(h.pool.address);
+    if (opp.cycle.hops.some((h) => used.has(h.pool.id))) continue;
+    for (const h of opp.cycle.hops) used.add(h.pool.id);
     chosen.push(opp);
   }
   return chosen;

@@ -7,6 +7,8 @@ export interface BotConfig {
   opStack: boolean;
   /** Lowercase. Start/end token of every cycle. */
   baseToken: Address;
+  /** Lowercase wrapped native token; V4 native-ETH pools are routed through it. */
+  weth: Address;
   /** Lowercase hub tokens (includes baseToken). */
   hubs: Address[];
   /** Lowercase long-tail tokens to always track, in addition to auto-discovered ones. */
@@ -35,6 +37,21 @@ export interface BotConfig {
   gasBase: bigint;
   gasPerHop: bigint;
   tradeLog: string;
+  /** Concentrated pools: load initialized ticks covering at least this relative price move each way. */
+  clRangePct: number;
+  /** Lowercase V4 hook contracts whose pools may be traded (hookless pools are always allowed). */
+  v4Hooks: Address[];
+  /**
+   * Websocket of a Flashblocks-aware RPC: the bot subscribes to `pendingLogs` and reacts to 200ms
+   * pre-confirmations instead of waiting for blocks. The way to get flashblock logs since Base's Azul upgrade.
+   */
+  flashblocksRpcWs?: string;
+  /** Raw Base Flashblocks websocket. Only useful on streams that still embed receipts (pre-Azul). */
+  flashblocksWs?: string;
+  /** Simulate against the "pending" (pre-confirmed) state. Needs a Flashblocks-aware RPC. */
+  simulatePending: boolean;
+  /** Skip the pre-send simulation and trust the local quote (the on-chain profit check still guards funds). */
+  skipSimulation: boolean;
 }
 
 export interface Secrets {
@@ -83,6 +100,10 @@ export function loadConfig(env: Env = process.env): BotConfig {
   const extraTokens = (env.EXTRA_TOKENS ?? "").split(",").map((s) => s.trim()).filter(Boolean).map(lower);
   const executor = env.EXECUTOR_ADDRESS ? lower(env.EXECUTOR_ADDRESS) : undefined;
 
+  const flashblocksWs = env.FLASHBLOCKS_WS || undefined;
+  const flashblocksRpcWs = env.FLASHBLOCKS_RPC_WS || undefined;
+  const v4Hooks = (env.V4_HOOKS ?? "").split(",").map((s) => s.trim()).filter(Boolean).map(lower);
+
   const bidPercent = num(env, "BID_PERCENT", 30);
   if (bidPercent >= 100) throw new Error("BID_PERCENT must be below 100");
 
@@ -90,9 +111,12 @@ export function loadConfig(env: Env = process.env): BotConfig {
     chain: preset.chain,
     opStack: preset.opStack,
     baseToken: lower(preset.baseToken),
+    weth: lower(preset.weth),
     hubs: Object.values(preset.hubs).map(lower),
     extraTokens,
-    dexes: preset.dexes.filter((d) => !disabled.has(d.name)).map((d) => ({ ...d, factory: lower(d.factory) })),
+    dexes: preset.dexes
+      .filter((d) => !disabled.has(d.name))
+      .map((d) => ({ ...d, factory: lower(d.factory), positionManager: d.positionManager ? lower(d.positionManager) : undefined })),
     executor,
     dryRun: bool(env, "DRY_RUN", true),
     maxHops: Math.min(Math.max(Math.floor(num(env, "MAX_HOPS", 3)), 2), 4),
@@ -108,6 +132,12 @@ export function loadConfig(env: Env = process.env): BotConfig {
     gasBase: 60_000n,
     gasPerHop: 75_000n,
     tradeLog: env.TRADE_LOG ?? "logs/trades.jsonl",
+    clRangePct: num(env, "CL_RANGE_PCT", 25) / 100,
+    v4Hooks,
+    flashblocksRpcWs,
+    flashblocksWs,
+    simulatePending: bool(env, "SIMULATE_PENDING", flashblocksRpcWs !== undefined || flashblocksWs !== undefined),
+    skipSimulation: bool(env, "SKIP_SIMULATION", false),
   };
 }
 

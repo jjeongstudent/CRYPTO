@@ -1,31 +1,39 @@
-import { type Address, type LocalAccount, type PublicClient, formatEther } from "viem";
+import { type Address, type Hex, type LocalAccount, type PublicClient, formatEther } from "viem";
 import { erc20Abi, executorAbi } from "./abi.js";
+import { type V4KeyBasic, loadTickWindows, nearWindowEdge, v4PoolId } from "./concentrated.js";
 import type { BotConfig } from "./config.js";
 import { CycleIndex, findCycles } from "./cycles.js";
-import { type Costs, ExecutionEngine, type TradeRecord, encodeRun, planCosts, shortError } from "./engine.js";
+import { type Costs, ExecutionEngine, type TradeRecord, encodeRun, estimateRouteGas, planCosts, shortError } from "./engine.js";
+import { ALL_TOPICS, type LogLike, applyLog, eventPoolId, isDeltaEvent } from "./events.js";
+import { type Flashblock, FlashblocksStream } from "./flashblocks.js";
+import { PendingLogsStream } from "./pendingLogs.js";
 import { log } from "./log.js";
 import {
   PoolRegistry,
-  decodeSync,
+  countActivity,
   fetchSymbols,
-  getSyncLogs,
   loadPools,
+  poolManagerOf,
   rankActiveTokens,
   recentPoolActivity,
-  refreshReserves,
+  refreshAll,
   topTokens,
 } from "./pools.js";
+import { getLogs } from "./rpc.js";
 import { findOpportunities, selectNonOverlapping } from "./strategy.js";
-import type { Cycle, Opportunity } from "./types.js";
+import type { ClPool, Cycle, Opportunity } from "./types.js";
 
 /** Simulation failures (other than "no longer profitable") before a route is ignored for good. */
 const MAX_ROUTE_FAILURES = 3;
 /** Blocks after which a pool locked by an in-flight trade is released even without a receipt. */
 const PENDING_TTL_BLOCKS = 15n;
 const REDISCOVER_EVERY_BLOCKS = 900;
+/** How long to remember liquidity deltas already applied from flashblocks. */
+const APPLIED_DELTA_TTL_BLOCKS = 10n;
 
 export interface Stats {
   blocks: number;
+  flashblocks: number;
   opportunities: number;
   simulated: number;
   sent: number;
@@ -37,7 +45,7 @@ export interface Stats {
 export interface Evaluated {
   opp: Opportunity;
   costs: Costs;
-  /** Exact profit from an on-chain simulation, when an executor is configured. */
+  /** Exact profit from an on-chain simulation, when one was run. */
   simulatedProfit?: bigint;
 }
 
@@ -46,17 +54,29 @@ export class ArbBot {
   index = new CycleIndex([]);
   symbols = new Map<Address, string>();
   lastBlock = 0n;
-  readonly stats: Stats = { blocks: 0, opportunities: 0, simulated: 0, sent: 0, landed: 0, reverted: 0, realizedNetWei: 0n };
+  readonly stats: Stats = { blocks: 0, flashblocks: 0, opportunities: 0, simulated: 0, sent: 0, landed: 0, reverted: 0, realizedNetWei: 0n };
   readonly engine: ExecutionEngine;
 
   private spokes: Address[] = [];
+  private readonly extraV4Keys = new Map<Hex, V4KeyBasic>();
   private blocksSinceResync = 0;
   private blocksSinceDiscovery = 0;
-  private readonly untrackedActivity = new Map<Address, number>();
-  private readonly pending = new Map<Address, bigint>();
+  private readonly untrackedActivity = new Map<Hex, number>();
+  private readonly pending = new Map<Hex, bigint>();
   private readonly routeFailures = new Map<string, number>();
   private readonly blockedRoutes = new Set<string>();
   private readonly inflight = new Set<Promise<unknown>>();
+  /** "tx:pool" liquidity deltas already applied from a flashblock, so the sealed block doesn't apply them twice. */
+  private readonly appliedDeltas = new Map<string, bigint>();
+  /** Concentrated pools whose price moved near the edge of their loaded tick window. */
+  private readonly staleWindows = new Set<ClPool>();
+  /** Pools to re-evaluate on the next event even if nothing changed (e.g. a window was just reloaded). */
+  private readonly dirty = new Set<Hex>();
+  private lastBaseFee = 0n;
+  private lastCapital = 0n;
+  private queue: Promise<unknown> = Promise.resolve();
+  private stream: FlashblocksStream | PendingLogsStream | undefined;
+  private warnedNoReceipts = false;
   private scannedAll = false;
   private stopped = false;
 
@@ -73,17 +93,21 @@ export class ArbBot {
     const block = head ?? (await this.client.getBlockNumber({ cacheTime: 0 }));
     await this.dropDexesWithoutCode();
     const activity = await recentPoolActivity(this.client, this.cfg, block);
-    const scores = await rankActiveTokens(this.client, this.cfg, activity);
+    const ranking = await rankActiveTokens(this.client, this.cfg, activity);
+    for (const key of ranking.v4Keys) this.extraV4Keys.set(v4PoolId(key), key);
     const exclude = new Set([...this.cfg.hubs, ...this.cfg.extraTokens]);
-    this.spokes = [...this.cfg.extraTokens, ...topTokens(scores, this.cfg.maxSpokes, exclude)];
+    this.spokes = [...this.cfg.extraTokens, ...topTokens(ranking.scores, this.cfg.maxSpokes, exclude)];
     await this.rebuild();
     await this.engine.init();
+    const [latest, capital] = await Promise.all([this.client.getBlock({ blockNumber: block }), this.capital()]);
+    this.lastBaseFee = latest.baseFeePerGas ?? 0n;
+    this.lastCapital = capital;
     this.lastBlock = block;
   }
 
   /** Reloads every pool for the current hub + spoke token set and rebuilds the cycle graph. */
   async rebuild(): Promise<void> {
-    const pools = await loadPools(this.client, this.cfg, [...this.cfg.hubs, ...this.spokes]);
+    const pools = await loadPools(this.client, this.cfg, [...this.cfg.hubs, ...this.spokes], [...this.extraV4Keys.values()]);
     this.registry = new PoolRegistry();
     for (const pool of pools) this.registry.add(pool);
     const cycles = findCycles(this.registry.all(), this.cfg.baseToken, this.cfg.maxHops);
@@ -93,6 +117,7 @@ export class ArbBot {
     this.symbols = await fetchSymbols(this.client, [...tokens].filter((t) => !this.symbols.has(t))).then(
       (fresh) => new Map([...this.symbols, ...fresh]),
     );
+    this.staleWindows.clear();
     this.scannedAll = false;
     const byDex: Record<string, number> = {};
     for (const p of this.registry.all()) byDex[p.dex] = (byDex[p.dex] ?? 0) + 1;
@@ -113,53 +138,149 @@ export class ArbBot {
     return balance < this.cfg.maxTradeWei ? balance : this.cfg.maxTradeWei;
   }
 
-  /** Syncs pool state up to `head`, then finds and (unless dry-run) executes the best opportunities. */
-  async processBlock(head: bigint): Promise<Evaluated[]> {
+  /** Runs state-mutating work one task at a time, in arrival order (blocks and flashblocks interleave). */
+  private serial<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(task, task);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Syncs pool state up to `head` from sealed blocks, then finds and (unless dry-run) executes opportunities. */
+  processBlock(head: bigint): Promise<Evaluated[]> {
+    return this.serial(() => this.onBlock(head));
+  }
+
+  /** Applies a pre-confirmed flashblock and trades on what it changed, ahead of the sealed block. */
+  processFlashblock(fb: Flashblock): Promise<Evaluated[]> {
+    return this.serial(() => this.onFlashblock(fb));
+  }
+
+  private async onBlock(head: bigint): Promise<Evaluated[]> {
     if (head <= this.lastBlock) return [];
     const [logs, block, capital] = await Promise.all([
-      getSyncLogs(this.client, this.lastBlock + 1n, head),
+      getLogs(this.client, ALL_TOPICS, this.lastBlock + 1n, head),
       this.client.getBlock({ blockNumber: head }),
       this.capital(),
     ]);
-    const changed = new Set<Address>();
-    for (const entry of logs) {
-      const address = entry.address.toLowerCase() as Address;
-      const reserves = decodeSync(entry);
-      if (!reserves) continue;
-      if (this.registry.has(address)) {
-        if (this.registry.applyReserves(address, reserves.reserve0, reserves.reserve1)) changed.add(address);
-      } else {
-        this.untrackedActivity.set(address, (this.untrackedActivity.get(address) ?? 0) + 1);
-      }
-    }
+    const { changed, mustReload } = this.applyLogs(logs, head);
     this.lastBlock = head;
+    this.lastBaseFee = block.baseFeePerGas ?? 0n;
+    this.lastCapital = capital;
     this.stats.blocks++;
     for (const [pool, sentAt] of this.pending) if (head - sentAt > PENDING_TTL_BLOCKS) this.pending.delete(pool);
+    for (const [key, at] of this.appliedDeltas) if (head - at > APPLIED_DELTA_TTL_BLOCKS) this.appliedDeltas.delete(key);
+    await this.reloadWindows(mustReload);
 
     if (++this.blocksSinceResync >= this.cfg.resyncEveryBlocks) {
       this.blocksSinceResync = 0;
-      for (const address of await refreshReserves(this.client, this.registry)) changed.add(address);
+      for (const id of await refreshAll(this.client, this.cfg, this.registry)) changed.add(id);
+      this.staleWindows.clear();
     }
     if (++this.blocksSinceDiscovery >= REDISCOVER_EVERY_BLOCKS) {
       this.blocksSinceDiscovery = 0;
       await this.rediscover();
     }
 
+    const accepted = await this.evaluateChanged(changed, capital, this.lastBaseFee, head);
+    await this.reloadStaleWindows();
+    return accepted;
+  }
+
+  private async onFlashblock(fb: Flashblock): Promise<Evaluated[]> {
+    // A flashblock for a block we already synced from the sealed chain adds nothing.
+    if (fb.blockNumber <= this.lastBlock) return [];
+    this.stats.flashblocks++;
+    if (fb.baseFeePerGas !== undefined) this.lastBaseFee = fb.baseFeePerGas;
+    const { changed, mustReload } = this.applyLogs(fb.logs, undefined, fb.blockNumber);
+    await this.reloadWindows(mustReload);
+    const accepted = await this.evaluateChanged(changed, this.lastCapital, this.lastBaseFee, fb.blockNumber);
+    await this.reloadStaleWindows();
+    return accepted;
+  }
+
+  /**
+   * Applies logs in execution order. Absolute events (Sync, Swap) are idempotent and re-applied from
+   * sealed blocks so the final state is right even if a flashblock was missed. Liquidity deltas
+   * (Mint/Burn/ModifyLiquidity) applied from a flashblock are remembered per transaction and pool
+   * and skipped when the sealed block (`sealedHead` set) replays them.
+   */
+  private applyLogs(logs: readonly LogLike[], sealedHead?: bigint, flashblock?: bigint): { changed: Set<Hex>; mustReload: Set<ClPool> } {
+    const changed = new Set<Hex>();
+    const mustReload = new Set<ClPool>();
+    const poolManager = poolManagerOf(this.cfg);
+    for (const entry of logs) {
+      const delta = isDeltaEvent(entry.topics[0]);
+      const key = delta && entry.transactionHash ? `${entry.transactionHash.toLowerCase()}:${eventPoolId(entry)}` : undefined;
+      if (sealedHead !== undefined && key && this.appliedDeltas.has(key)) continue;
+      const effect = applyLog(this.registry.map, entry, poolManager);
+      if (effect.type === "changed") {
+        changed.add(effect.id);
+        const pool = this.registry.get(effect.id);
+        if (pool?.family !== "cl") continue;
+        // A delta that needs the window reloaded is not marked applied: the sealed block replays it on
+        // top of the reloaded (pre-flashblock) ticks.
+        if (effect.reload) mustReload.add(pool);
+        else if (flashblock !== undefined && key) this.appliedDeltas.set(key, flashblock);
+        if (nearWindowEdge(pool.state)) this.staleWindows.add(pool);
+      } else if (effect.type === "untracked") {
+        countActivity(this.untrackedActivity, entry.address, entry.topics, poolManager);
+      }
+    }
+    return { changed, mustReload };
+  }
+
+  /** Re-reads tick windows that local events could not keep exact. Must finish before quoting those pools. */
+  private async reloadWindows(pools: Set<ClPool>): Promise<void> {
+    if (pools.size === 0) return;
+    try {
+      await loadTickWindows(this.client, [...pools], this.cfg.clRangePct, poolManagerOf(this.cfg));
+    } catch (err) {
+      // Leave them stale; the post-trade reload or the next resync retries.
+      log.warn("tick window reload failed", { pools: pools.size, error: shortError(err) });
+      for (const p of pools) this.staleWindows.add(p);
+    }
+  }
+
+  private async evaluateChanged(changed: Set<Hex>, capital: bigint, baseFee: bigint, head: bigint): Promise<Evaluated[]> {
+    for (const id of this.dirty) changed.add(id);
+    this.dirty.clear();
     const cycles = this.scannedAll ? this.index.affectedBy(changed) : this.index.cycles;
     this.scannedAll = true;
     if (cycles.length === 0) return [];
-    return this.act(cycles, capital, block.baseFeePerGas ?? 0n, head);
+    return this.act(cycles, capital, baseFee, head);
+  }
+
+  /** Re-centres tick windows that the price has drifted towards. Done after trading to keep it off the hot path. */
+  private async reloadStaleWindows(): Promise<void> {
+    if (this.staleWindows.size === 0) return;
+    const pools = [...this.staleWindows].filter((p) => this.registry.get(p.id) === p);
+    this.staleWindows.clear();
+    try {
+      await loadTickWindows(this.client, pools, this.cfg.clRangePct, poolManagerOf(this.cfg));
+      for (const p of pools) this.dirty.add(p.id);
+    } catch (err) {
+      log.warn("tick window reload failed", { pools: pools.length, error: shortError(err) });
+      for (const p of pools) this.staleWindows.add(p);
+    }
   }
 
   private async rediscover(): Promise<void> {
     if (this.untrackedActivity.size === 0) return;
-    const scores = await rankActiveTokens(this.client, this.cfg, this.untrackedActivity);
+    const ranking = await rankActiveTokens(this.client, this.cfg, this.untrackedActivity);
     this.untrackedActivity.clear();
+    let newKeys = 0;
+    for (const key of ranking.v4Keys) {
+      const id = v4PoolId(key);
+      if (!this.extraV4Keys.has(id)) {
+        this.extraV4Keys.set(id, key);
+        newKeys++;
+      }
+    }
     const known = new Set([...this.cfg.hubs, ...this.spokes]);
     const room = this.cfg.maxSpokes + this.cfg.extraTokens.length - this.spokes.length;
-    const fresh = topTokens(scores, Math.max(room, 0), known);
-    if (fresh.length === 0) return;
-    log.info("discovered new active tokens", { count: fresh.length });
+    const fresh = topTokens(ranking.scores, Math.max(room, 0), known);
+    if (fresh.length === 0 && newKeys === 0) return;
+    log.info("discovered new active markets", { tokens: fresh.length, v4Pools: newKeys });
     this.spokes.push(...fresh);
     await this.rebuild();
   }
@@ -185,8 +306,10 @@ export class ArbBot {
   async evaluate(opp: Opportunity, baseFee: bigint): Promise<Evaluated | undefined> {
     const route = this.describe(opp.cycle);
     const calldata = encodeRun(this.cfg.baseToken, opp.amountIn, 0n, opp.cycle);
-    if (!this.engine.canSimulate) {
-      const gas = this.cfg.gasBase + this.cfg.gasPerHop * BigInt(opp.cycle.hops.length);
+    const modelGas = estimateRouteGas(opp.cycle, this.cfg.gasBase, this.cfg.gasPerHop);
+    if (!this.engine.canSimulate || this.cfg.skipSimulation) {
+      // Without simulation, budget generously for gas: an underestimate would make the tx run out of gas.
+      const gas = this.engine.canSimulate ? modelGas * 2n : modelGas;
       const costs = planCosts(opp.grossProfit, gas, baseFee, await this.engine.l1Fee(calldata), this.cfg.bidBps);
       return costs.net >= this.cfg.minProfitWei ? { opp, costs } : undefined;
     }
@@ -231,18 +354,18 @@ export class ArbBot {
 
     // On-chain floor: revert unless gross profit still covers every cost plus the minimum net.
     const minProfit = ev.costs.totalCost + this.cfg.minProfitWei;
-    for (const hop of ev.opp.cycle.hops) this.pending.set(hop.pool.address, head);
+    for (const hop of ev.opp.cycle.hops) this.pending.set(hop.pool.id, head);
     try {
       record.hash = await this.engine.send(ev.opp, ev.costs, minProfit);
       this.stats.sent++;
       log.info("SENT", { ...summary, hash: record.hash });
     } catch (err) {
-      for (const hop of ev.opp.cycle.hops) this.pending.delete(hop.pool.address);
+      for (const hop of ev.opp.cycle.hops) this.pending.delete(hop.pool.id);
       log.warn("send failed", { route, error: shortError(err) });
       return;
     }
     const settled = this.engine.settle(record).then(async (r) => {
-      for (const hop of ev.opp.cycle.hops) this.pending.delete(hop.pool.address);
+      for (const hop of ev.opp.cycle.hops) this.pending.delete(hop.pool.id);
       const net = (r.realizedProfit ?? 0n) - (r.realizedFees ?? 0n);
       if (r.status === "success") this.stats.landed++;
       else if (r.status === "reverted") this.stats.reverted++;
@@ -288,10 +411,12 @@ export class ArbBot {
     log.info("bot running", {
       mode: this.cfg.dryRun ? (this.engine.canSimulate ? "dry-run" : "paper") : "LIVE",
       executor: this.cfg.executor ?? "none",
+      flashblocks: this.cfg.flashblocksRpcWs ? "pendingLogs" : this.cfg.flashblocksWs ? "raw stream" : "off",
       maxTrade: formatEther(this.cfg.maxTradeWei),
       minProfit: formatEther(this.cfg.minProfitWei),
       bidPercent: this.cfg.bidBps / 100,
     });
+    this.stream = this.startFlashblocks();
     let lastStats = Date.now();
     while (!this.stopped) {
       try {
@@ -307,15 +432,44 @@ export class ArbBot {
         log.info("stats", { ...this.stats, realizedNetEth: formatEther(this.stats.realizedNetWei) });
       }
     }
+    this.stream?.stop();
     await Promise.allSettled([...this.inflight]);
   }
 
   stop(): void {
     this.stopped = true;
+    this.stream?.stop();
+  }
+
+  /** Starts the pre-confirmation feed: the RPC `pendingLogs` subscription if configured, else the raw stream. */
+  private startFlashblocks(): FlashblocksStream | PendingLogsStream | undefined {
+    const onStatus = (status: string, detail?: string) => log.info(`flashblocks ${status}`, detail ? { detail } : undefined);
+    const handle = (fb: Flashblock) => {
+      this.processFlashblock(fb).catch((err) => log.error("flashblock processing failed", { error: shortError(err) }));
+    };
+    let stream: FlashblocksStream | PendingLogsStream | undefined;
+    if (this.cfg.flashblocksRpcWs) {
+      stream = new PendingLogsStream({ url: this.cfg.flashblocksRpcWs, topics: ALL_TOPICS, onBatch: handle, onStatus });
+    } else if (this.cfg.flashblocksWs) {
+      stream = new FlashblocksStream({
+        url: this.cfg.flashblocksWs,
+        onStatus,
+        onFlashblock: (fb) => {
+          if (fb.receiptsIncluded === false && !this.warnedNoReceipts) {
+            this.warnedNoReceipts = true;
+            log.warn("this flashblocks stream carries no receipts (Base Azul+): set FLASHBLOCKS_RPC_WS to a Flashblocks-aware RPC websocket");
+          }
+          handle(fb);
+        },
+      });
+    }
+    stream?.start();
+    return stream;
   }
 
   /** Waits for every in-flight trade to settle (used by tests and on shutdown). */
   async drain(): Promise<void> {
+    await this.queue;
     while (this.inflight.size > 0) await Promise.allSettled([...this.inflight]);
   }
 }
@@ -333,7 +487,7 @@ function byNetDescending(a: Evaluated, b: Evaluated): number {
 }
 
 function routeKey(cycle: Cycle): string {
-  return cycle.hops.map((h) => `${h.pool.address}:${h.zeroForOne ? 1 : 0}`).join(",");
+  return cycle.hops.map((h) => `${h.pool.id}:${h.zeroForOne ? 1 : 0}`).join(",");
 }
 
 function sleep(ms: number): Promise<void> {
