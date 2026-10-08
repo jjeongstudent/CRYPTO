@@ -69,7 +69,7 @@ function payload(opts: {
   return msg;
 }
 
-/** Verbatim V0_5_0_PAYLOAD_JSON from node-reth crates/common/flashblocks/src/block.rs (bloom shortened). */
+/** V0_5_0_PAYLOAD_JSON from node-reth crates/common/flashblocks/src/block.rs, with the bloom shortened and one log added. */
 const NODE_RETH_V0_5_0 = `{
   "payload_id": "0x0000000000000000",
   "index": 0,
@@ -181,6 +181,41 @@ describe("parseFlashblock", () => {
     };
     const fb = parseFlashblock(payload({ txs, receipts, blockNumber: 7 }))!;
     expect(fb.logs).toEqual([{ address: POOL_B, topics: [], data: "0x0b", transactionHash: hash(TX_LEGACY) }]);
+  });
+
+  it("reads string booleans as status and rejects negative block numbers", () => {
+    const txs = [TX_1559, TX_LEGACY];
+    const receipts = {
+      [hash(TX_1559)]: { status: "false", logs: [log(POOL_A, [], "0x01")] },
+      [hash(TX_LEGACY)]: { status: "true", logs: [log(POOL_B, [], "0x02")] },
+    };
+    const fb = parseFlashblock(payload({ txs, receipts, blockNumber: 7 }))!;
+    expect(fb.logs.map((l) => l.data)).toEqual(["0x02"]);
+    expect(parseFlashblock(payload({ index: 1, blockNumber: "-1" }))).toBeNull();
+    expect(parseFlashblock(payload({ index: 1, blockNumber: -1 }))).toBeNull();
+  });
+
+  it("parses node-reth's pinned subsequent (index > 0, no base) payload", () => {
+    // subsequent_flashblock_without_base_deserializes in node-reth crates/common/flashblocks/src/block.rs:
+    // the post-Azul shape, metadata without receipts.
+    const fb = parseFlashblock(
+      JSON.parse(`{
+        "payload_id": "0x0000000000000000",
+        "index": 3,
+        "diff": {
+          "state_root": "${"0x" + "04".repeat(32)}",
+          "receipts_root": "${"0x" + "05".repeat(32)}",
+          "logs_bloom": "${BLOOM}",
+          "gas_used": "0x5208",
+          "block_hash": "${"0x" + "06".repeat(32)}",
+          "transactions": [],
+          "withdrawals": [],
+          "withdrawals_root": "${"0x" + "07".repeat(32)}"
+        },
+        "metadata": { "block_number": 99 }
+      }`),
+    )!;
+    expect(fb).toEqual({ blockNumber: 99n, index: 3, payloadId: "0x0000000000000000", transactionHashes: [], logs: [], receiptsIncluded: false });
   });
 
   it("appends receipts whose tx is not in this flashblock after the ordered ones, in stable order", () => {
@@ -341,7 +376,7 @@ describe("FlashblocksStream", () => {
     for (const fn of cleanup.splice(0).reverse()) await fn();
   });
 
-  async function setup(onConnection: (socket: WsSocket, n: number) => void, opts: { staleMs?: number } = {}) {
+  async function setup(onConnection: (socket: WsSocket, n: number) => void, opts: { staleMs?: number; maxBackoffMs?: number } = {}) {
     const server = await startServer(onConnection);
     cleanup.push(server.close);
     const received: Flashblock[] = [];
@@ -375,6 +410,41 @@ describe("FlashblocksStream", () => {
     expect(received[0]!.transactionHashes).toEqual([hash(TX_1559)]);
     expect(stream.stats).toEqual({ messages: 5, flashblocks: 3, reconnects: 0, parseErrors: 2 });
     expect(stream.connected).toBe(true);
+  });
+
+  it("delivers an exact re-delivery of a flashblock only once", async () => {
+    // node-reth's websocket-proxy fans in every upstream without de-duplicating (bin/websocket-proxy/src/main.rs),
+    // and its own client drops repeats (crates/execution/flashblocks/src/validation.rs, `Duplicate`).
+    const { stream, received } = await setup((socket) => {
+      socket.send(frame(100, 0));
+      socket.send(frame(100, 0));
+      socket.send(frame(100, 1));
+      socket.send(brotliCompressSync(Buffer.from(frame(100, 1))));
+      socket.send(frame(101, 0));
+    });
+    stream.start();
+    await waitFor(() => stream.stats.messages === 5);
+    expect(received.map((fb) => [fb.blockNumber, fb.index])).toEqual([
+      [100n, 0],
+      [100n, 1],
+      [101n, 0],
+    ]);
+    expect(stream.stats).toEqual({ messages: 5, flashblocks: 3, reconnects: 0, parseErrors: 0 });
+  });
+
+  it("does not reset the backoff for a server that only sends junk before dropping", async () => {
+    const { stream, server } = await setup(
+      (socket) => {
+        socket.send("rate limited");
+        setTimeout(() => socket.terminate(), 5);
+      },
+      { maxBackoffMs: 5_000 },
+    );
+    stream.start();
+    // Growing backoff connects at ~0, 250, 750, 1750ms; resetting on any message would keep it at 250ms (5+ here).
+    await sleep(1_200);
+    expect(server.sockets.length).toBeGreaterThanOrEqual(2);
+    expect(server.sockets.length).toBeLessThanOrEqual(3);
   });
 
   it("survives a throwing onFlashblock handler", async () => {

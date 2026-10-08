@@ -93,23 +93,28 @@ function field(obj: Json | undefined, snake: string): unknown {
   return obj[snake.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())];
 }
 
-/** Hex quantity, decimal string or JSON number. */
+/** Non-negative hex quantity, decimal string or JSON number. */
 function toBigInt(v: unknown): bigint | undefined {
   try {
-    if (typeof v === "bigint") return v;
+    if (typeof v === "bigint") return v >= 0n ? v : undefined;
     if (typeof v === "number") return Number.isSafeInteger(v) && v >= 0 ? BigInt(v) : undefined;
-    if (typeof v === "string" && v.length > 0) return BigInt(v);
+    if (typeof v === "string" && /^(0x[0-9a-f]+|[0-9]+)$/i.test(v.trim())) return BigInt(v.trim());
   } catch {
     // Not a number.
   }
   return undefined;
 }
 
-/** EIP-658 status in any of its encodings; a missing status (pre-Byzantium `root`) counts as success. */
+/**
+ * EIP-658 status in any of its encodings: alloy serializes "0x1"/"0x0" (alloy consensus
+ * receipt/status.rs, `alloy_serde::quantity` bool), node-reth's fixtures use JSON booleans.
+ * A missing status (pre-Byzantium `root`) counts as success.
+ */
 function succeeded(receipt: Json): boolean {
   const status = receipt.status;
   if (status === undefined || status === null) return true;
   if (typeof status === "boolean") return status;
+  if (typeof status === "string" && /^(true|false)$/i.test(status)) return status.toLowerCase() === "true";
   return toBigInt(status) !== 0n;
 }
 
@@ -215,8 +220,10 @@ export interface FlashblocksOptions {
 }
 
 const INITIAL_BACKOFF_MS = 250;
+/** Flashblocks remembered for de-duplication: a few blocks' worth at ~10 per 2s block. */
+const DEDUP_WINDOW = 64;
 
-/** Websocket client for the flashblocks feed: reconnects with exponential backoff and on silence. */
+/** Websocket client for the flashblocks feed: reconnects with exponential backoff and on silence, drops re-deliveries. */
 export class FlashblocksStream {
   readonly stats = { messages: 0, flashblocks: 0, reconnects: 0, parseErrors: 0 };
   private readonly staleMs: number;
@@ -227,6 +234,8 @@ export class FlashblocksStream {
   private backoffMs = INITIAL_BACKOFF_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private staleTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Recently delivered flashblock keys, oldest first (Set keeps insertion order). */
+  private readonly seen = new Set<string>();
 
   constructor(private readonly opts: FlashblocksOptions) {
     this.staleMs = opts.staleMs ?? 10_000;
@@ -282,8 +291,6 @@ export class FlashblocksStream {
     };
     ws.onmessage = (ev: MessageEvent) => {
       if (this.ws !== ws) return;
-      // Backoff resets on data rather than on open, so a server that accepts then drops can't hot-loop us.
-      this.backoffMs = INITIAL_BACKOFF_MS;
       this.armWatchdog();
       this.handle(ev.data);
     };
@@ -317,6 +324,17 @@ export class FlashblocksStream {
       this.stats.parseErrors++;
       return;
     }
+    // Backoff resets on a real flashblock rather than on open or any message, so a server that
+    // accepts (and perhaps sends an error text) then drops can't hot-loop us.
+    this.backoffMs = INITIAL_BACKOFF_MS;
+    // The websocket-proxy fans in all its upstreams without de-duplicating (node-reth
+    // bin/websocket-proxy/src/main.rs); node-reth's own client drops repeats too
+    // (crates/execution/flashblocks/src/validation.rs, `Duplicate`). payload_id is part of the key so
+    // a rebuilt block (new payload) is still delivered.
+    const key = `${fb.blockNumber}:${fb.index}:${fb.payloadId}`;
+    if (this.seen.has(key)) return;
+    this.seen.add(key);
+    if (this.seen.size > DEDUP_WINDOW) this.seen.delete(this.seen.values().next().value!);
     this.stats.flashblocks++;
     try {
       this.opts.onFlashblock(fb);

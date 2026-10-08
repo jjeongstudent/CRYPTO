@@ -30,6 +30,30 @@ contract FakePool {
     function swap(uint256, uint256, address, bytes calldata) external {}
 }
 
+/// @dev An attacker's pair: reports whatever reserves it is rigged with, keeps what it is sent, and on swap
+///      hands back `refund` of `refundToken` (a worthless token the attacker controls).
+contract RiggedPair {
+    uint256 internal reserve0;
+    uint256 internal reserve1;
+    MockERC20 internal refundToken;
+    uint256 internal refund;
+
+    function rig(uint256 reserve0_, uint256 reserve1_, MockERC20 refundToken_, uint256 refund_) external {
+        reserve0 = reserve0_;
+        reserve1 = reserve1_;
+        refundToken = refundToken_;
+        refund = refund_;
+    }
+
+    function getReserves() external view returns (uint256, uint256, uint256) {
+        return (reserve0, reserve1, 0);
+    }
+
+    function swap(uint256, uint256, address to, bytes calldata) external {
+        if (refund != 0) require(refundToken.transfer(to, refund));
+    }
+}
+
 contract ExecutorTest is Test {
     address internal owner = makeAddr("owner");
     address internal operator = makeAddr("operator");
@@ -228,11 +252,37 @@ contract ExecutorTest is Test {
         });
         hops[1] = _hop(real, 30, address(tka));
 
+        // The fake pool claims to pay ~1e30 TKA; the executor holds none, so the next leg cannot pay the pair.
         vm.prank(operator);
-        vm.expectRevert();
+        vm.expectRevert(Executor.TransferFailed.selector);
         executor.run(address(weth), 50 ether, 0, hops);
         assertEq(weth.balanceOf(address(executor)), 50 ether);
         assertEq(weth.balanceOf(address(fake)), 0);
+    }
+
+    /// @dev A worthless start token makes the start-token check trivially pass, so every token the route
+    ///      spends must be protected too: here the executor's WETH is an intermediate that two rigged
+    ///      pairs try to walk out of the door.
+    function test_leakedOperatorKeyCannotDrainIntermediateInventory() public {
+        MockERC20 junk = new MockERC20("Junk", "JNK", 18);
+        junk.mint(address(executor), 1); // the attacker can always airdrop its own token
+        RiggedPair claim = new RiggedPair();
+        RiggedPair sink = new RiggedPair();
+        // `claim` takes 1 JNK and "pays" 50 WETH (out = 1 * 10000 * 50e18 / (0 + 10000)) without sending any.
+        claim.rig(0, 50 ether, junk, 0);
+        // `sink` receives the 50 WETH and refunds the JNK so the start-token balance is unchanged.
+        junk.mint(address(sink), 1);
+        sink.rig(1, 1, junk, 1);
+
+        Executor.Hop[] memory hops = new Executor.Hop[](2);
+        hops[0] = Executor.Hop(0, address(claim), address(junk), address(weth), 0, 0, true, 0);
+        hops[1] = Executor.Hop(0, address(sink), address(weth), address(junk), 0, 0, true, 0);
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(Executor.NotProfitable.selector, 50 ether, 0));
+        executor.run(address(junk), 1, 0, hops);
+        assertEq(weth.balanceOf(address(executor)), 50 ether);
+        assertEq(weth.balanceOf(address(sink)), 0);
     }
 
     function test_ownerAdmin() public {

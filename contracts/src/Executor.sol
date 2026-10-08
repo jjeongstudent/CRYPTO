@@ -60,8 +60,10 @@ interface IPoolManagerMinimal {
 ///   - `run` never grants approvals. Every hop pays from this contract's own balance.
 ///   - Callbacks are only honoured from the V3 pool / V4 PoolManager the current hop is calling, and a V3
 ///     callback can pay at most once and at most the amount routed into that hop.
-///   - The final balance check means a route can never reduce this contract's balance of `token`.
-///     Even a leaked operator key cannot drain inventory through `run`; it can only waste gas.
+///   - The final balance checks mean a route can never reduce this contract's balance of `token`, nor of
+///     any other token it spends (every hop's `tokenIn`). Checking `token` alone is not enough: with a
+///     worthless start token that check passes trivially while a fake pool collects real inventory.
+///     So even a leaked operator key cannot drain inventory through `run`; it can only waste gas.
 ///   - Only `owner` (keep this a cold wallet) can withdraw funds.
 contract Executor {
     struct Hop {
@@ -137,10 +139,16 @@ contract Executor {
         if (msg.sender != operator) revert NotOperator();
         _validate(token, hops);
 
-        uint256 balanceBefore = IERC20Minimal(token).balanceOf(address(this));
+        // The route is a cycle, so the tokens it can spend are exactly the hops' tokenIn (hops[0]'s is `token`).
+        uint256 n = hops.length;
+        uint256[] memory held = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            held[i] = IERC20Minimal(hops[i].tokenIn).balanceOf(address(this));
+        }
+
         active = true;
         uint256 amount = amountIn;
-        for (uint256 i; i < hops.length; ++i) {
+        for (uint256 i; i < n; ++i) {
             Hop calldata hop = hops[i];
             if (hop.kind == KIND_V2) amount = _swapV2(hop, amount);
             else if (hop.kind == KIND_V3) amount = _swapV3(hop, amount);
@@ -148,8 +156,14 @@ contract Executor {
         }
         active = false;
 
+        uint256 balanceBefore = held[0];
         uint256 balanceAfter = IERC20Minimal(token).balanceOf(address(this));
         if (balanceAfter < balanceBefore + minProfit) revert NotProfitable(balanceBefore, balanceAfter);
+        // Intermediate tokens may only grow (partial fills leave input behind), never fund the route.
+        for (uint256 i = 1; i < n; ++i) {
+            uint256 heldAfter = IERC20Minimal(hops[i].tokenIn).balanceOf(address(this));
+            if (heldAfter < held[i]) revert NotProfitable(held[i], heldAfter);
+        }
         return balanceAfter - balanceBefore;
     }
 
@@ -175,7 +189,7 @@ contract Executor {
             IPoolManagerMinimal.PoolKey(currency0, currency1, hop.fee, hop.tickSpacing, hop.pool);
         IPoolManagerMinimal.SwapParams memory params = IPoolManagerMinimal.SwapParams(
             hop.zeroForOne,
-            // forge-lint: disable-next-line(unsafe-typecast) an absurd amount just fails; the balance check holds
+            // forge-lint: disable-next-line(unsafe-typecast) range checked in _swapV4
             -int256(amount), // negative = exact input
             hop.zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1
         );
@@ -261,10 +275,12 @@ contract Executor {
     }
 
     function _swapV3(Hop calldata hop, uint256 amountIn) private returns (uint256 amountOut) {
+        // Above int256 max the cast would turn into a negative amount, i.e. an exact-OUTPUT swap.
+        if (amountIn > uint256(type(int256).max)) revert BadRoute();
         expectedPool = hop.pool;
         payToken = hop.tokenIn;
         maxPayment = amountIn;
-        // forge-lint: disable-next-line(unsafe-typecast) an absurd amount just fails; the balance check holds
+        // forge-lint: disable-next-line(unsafe-typecast) range checked above
         int256 amountSpecified = int256(amountIn);
         (int256 amount0, int256 amount1) = IV3PoolMinimal(hop.pool)
             .swap(
@@ -276,10 +292,16 @@ contract Executor {
             );
         // A pool that never called back leaves the slot set; clear it so it cannot be used later.
         expectedPool = address(0);
-        amountOut = uint256(-(hop.zeroForOne ? amount1 : amount0));
+        // The output delta must be <= 0 (paid to us); a positive one would cast to a ~2^256 hop amount.
+        int256 out = hop.zeroForOne ? amount1 : amount0;
+        if (out > 0) revert BadRoute();
+        // forge-lint: disable-next-line(unsafe-typecast) sign checked above
+        amountOut = uint256(-out);
     }
 
     function _swapV4(Hop calldata hop, uint256 amountIn) private returns (uint256 amountOut) {
+        // -int256(amountIn) below must stay negative (exact input).
+        if (amountIn > uint256(type(int256).max)) revert BadRoute();
         bytes memory result = IPoolManagerMinimal(poolManager).unlock(abi.encode(hop, amountIn));
         amountOut = abi.decode(result, (uint256));
     }

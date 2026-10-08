@@ -29,6 +29,7 @@ interface IV2Reserves {
 interface IBalance {
     function balanceOf(address) external view returns (uint256);
     function allowance(address, address) external view returns (uint256);
+    function transfer(address, uint256) external returns (bool);
 }
 
 /// @dev Pretends to be a V3 pool and scripts its callbacks: demands `demand` of the input token `calls`
@@ -53,6 +54,64 @@ contract EvilV3Pool {
             Executor(payable(msg.sender)).uniswapV3SwapCallback(amount0, amount1, "");
         }
     }
+
+    /// @dev Lets a pool from an earlier hop try to collect during someone else's hop.
+    function strike(address executor, int256 amount0, int256 amount1) external {
+        Executor(payable(executor)).uniswapV3SwapCallback(amount0, amount1, "");
+    }
+}
+
+/// @dev Instead of calling back itself, has the pool of an earlier hop ask for the payment.
+contract CrossHopV3Pool {
+    EvilV3Pool public immutable accomplice;
+
+    constructor(EvilV3Pool accomplice_) {
+        accomplice = accomplice_;
+    }
+
+    function swap(address, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata)
+        external
+        returns (int256, int256)
+    {
+        accomplice.strike(
+            msg.sender, zeroForOne ? amountSpecified : int256(0), zeroForOne ? int256(0) : amountSpecified
+        );
+        return (0, 0);
+    }
+}
+
+/// @dev PancakeSwap V3 calls `pancakeV3SwapCallback` instead of `uniswapV3SwapCallback`. Pays `rate` units
+///      out per unit in (either direction) from its own balance and checks it was paid, like a real pool.
+contract PancakeStylePool {
+    address public immutable token0;
+    address public immutable token1;
+    uint256 public immutable rate;
+
+    constructor(address token0_, address token1_, uint256 rate_) {
+        (token0, token1) = token0_ < token1_ ? (token0_, token1_) : (token1_, token0_);
+        rate = rate_;
+    }
+
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1)
+    {
+        // forge-lint: disable-next-line(unsafe-typecast) test mock: exact input only
+        uint256 amountIn = uint256(amountSpecified);
+        uint256 amountOut = amountIn * rate;
+        (address tokenIn, address tokenOut) = zeroForOne ? (token0, token1) : (token1, token0);
+        // forge-lint: disable-next-line(unsafe-typecast) test mock: small amounts
+        int256 paid = -int256(amountOut);
+        (amount0, amount1) = zeroForOne ? (amountSpecified, paid) : (paid, amountSpecified);
+        require(IBalance(tokenOut).transfer(recipient, amountOut));
+        uint256 balanceBefore = IBalance(tokenIn).balanceOf(address(this));
+        PancakeCallee(msg.sender).pancakeV3SwapCallback(amount0, amount1, data);
+        require(IBalance(tokenIn).balanceOf(address(this)) >= balanceBefore + amountIn, "IIA");
+    }
+}
+
+interface PancakeCallee {
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external;
 }
 
 /// @dev A V4 hook (BEFORE_SWAP | BEFORE_SWAP_RETURNS_DELTA) that takes the whole exact input for itself
@@ -76,6 +135,38 @@ contract StealingHook {
         manager.take(params.zeroForOne ? key.currency0 : key.currency1, thief, amount);
         // BeforeSwapDelta: the specified-currency delta lives in the upper 128 bits.
         return (StealingHook.beforeSwap.selector, int256(amount) << 128, 0);
+    }
+}
+
+/// @dev A V4 hook (BEFORE_SWAP only) that, mid-swap, tries to re-enter the executor's callbacks and
+///      records the error each attempt got. It otherwise leaves the swap alone.
+contract ReentrantHook {
+    address public immutable executor;
+    bytes4 public unlockCallbackError;
+    bytes4 public v3CallbackError;
+    bytes4 public pancakeCallbackError;
+
+    constructor(address executor_) {
+        executor = executor_;
+    }
+
+    function beforeSwap(
+        address,
+        IPoolManagerHelper.PoolKey calldata key,
+        IPoolManagerHelper.SwapParams calldata,
+        bytes calldata
+    ) external returns (bytes4, int256, uint24) {
+        Executor.Hop memory steal = Executor.Hop(2, key.hooks, key.currency1, key.currency0, key.fee, 60, false, 0);
+        unlockCallbackError = _attempt(abi.encodeCall(Executor.unlockCallback, (abi.encode(steal, 1 ether))));
+        v3CallbackError = _attempt(abi.encodeCall(Executor.uniswapV3SwapCallback, (1 ether, 1 ether, "")));
+        pancakeCallbackError = _attempt(abi.encodeCall(Executor.pancakeV3SwapCallback, (1 ether, 1 ether, "")));
+        return (ReentrantHook.beforeSwap.selector, 0, 0);
+    }
+
+    function _attempt(bytes memory call) private returns (bytes4) {
+        (bool ok, bytes memory err) = executor.call(call);
+        // forge-lint: disable-next-line(unsafe-typecast) the selector is the first 4 bytes of the revert data
+        return ok ? bytes4(0xffffffff) : bytes4(err);
     }
 }
 
@@ -513,6 +604,198 @@ contract ExecutorConcentratedTest is Test {
         );
         assertEq(weth.balanceOf(address(executor)), 50 ether);
         assertEq(weth.balanceOf(attacker), 0);
+    }
+
+    /// @dev With a worthless start token the start-token check passes trivially; the executor's WETH is an
+    ///      intermediate that a fake pool claims to have paid and a second fake pool collects.
+    function test_leakedOperatorKeyCannotDrainIntermediateWeth() public {
+        MockERC20 junk = new MockERC20("Junk", "JNK", 18);
+        EvilV3Pool claim = new EvilV3Pool();
+        EvilV3Pool sink = new EvilV3Pool();
+        claim.configure(0, 0, 50 ether); // never calls back, "pays" 50 WETH
+        sink.configure(50 ether, 1, 0); // asks for the 50 WETH, pays nothing
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(Executor.NotProfitable.selector, 50 ether, 0));
+        executor.run(
+            address(junk),
+            1,
+            0,
+            _route(
+                _v3Hop(address(claim), address(junk), address(weth)),
+                _v3Hop(address(sink), address(weth), address(junk))
+            )
+        );
+        assertEq(weth.balanceOf(address(executor)), 50 ether);
+        assertEq(weth.balanceOf(address(sink)), 0);
+    }
+
+    /// @dev Same idea through a real V4 pool: the executor's WETH is sold for TKA, which a fake pool collects.
+    function test_leakedOperatorKeyCannotDrainIntermediateWethThroughV4() public {
+        IPoolManagerHelper.PoolKey memory key = _v4Pool(address(weth), address(tka), TICK_2992, LIQUIDITY);
+        MockERC20 junk = new MockERC20("Junk", "JNK", 18);
+        EvilV3Pool claim = new EvilV3Pool();
+        EvilV3Pool sink = new EvilV3Pool();
+        claim.configure(0, 0, 10 ether);
+        uint256 snap = vm.snapshotState();
+        uint256 tkaOut = v4.swapExactIn(key, address(weth) < address(tka), 10 ether, address(this));
+        vm.revertToState(snap);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        sink.configure(int256(tkaOut), 1, 0);
+
+        Executor.Hop[] memory hops = new Executor.Hop[](3);
+        hops[0] = _v3Hop(address(claim), address(junk), address(weth));
+        hops[1] = _v4Hop(key, address(weth), address(tka), 0);
+        hops[2] = _v3Hop(address(sink), address(tka), address(junk));
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(Executor.NotProfitable.selector, 50 ether, 40 ether));
+        executor.run(address(junk), 1, 0, hops);
+        assertEq(weth.balanceOf(address(executor)), 50 ether);
+        assertEq(tka.balanceOf(address(sink)), 0);
+    }
+
+    /// @dev Raw ETH held by the executor is never spent: native V4 input is only ever unwrapped WETH.
+    function test_leakedOperatorKeyCannotSpendRawEth() public {
+        IPoolManagerHelper.PoolKey memory key = _v4Pool(address(0), address(tka), TICK_2992, LIQUIDITY);
+        address pool2 = _v2Pool(tka, 2_700_000 ether, address(weth), 1000 ether);
+        vm.prank(owner);
+        executor.withdraw(address(weth), owner, 50 ether);
+        vm.deal(address(executor), 10 ether);
+
+        vm.prank(operator);
+        vm.expectRevert(bytes("")); // WETH9.withdraw: insufficient WETH
+        executor.run(
+            address(weth),
+            1 ether,
+            0,
+            _route(_v4Hop(key, address(weth), address(tka), 1), _v2Hop(pool2, address(tka), address(weth)))
+        );
+        assertEq(address(executor).balance, 10 ether);
+    }
+
+    /// @dev A pool reporting a positive delta for the token it pays out must not become a ~2^256 hop amount.
+    function test_v3PositiveOutputDeltaIsRejected() public {
+        EvilV3Pool evil = new EvilV3Pool();
+        address pool2 = _v2Pool(tka, 2_700_000 ether, address(weth), 1000 ether);
+        evil.configure(1 ether, 1, -1);
+
+        vm.prank(operator);
+        vm.expectRevert(Executor.BadRoute.selector);
+        executor.run(
+            address(weth),
+            1 ether,
+            0,
+            _route(_v3Hop(address(evil), address(weth), address(tka)), _v2Hop(pool2, address(tka), address(weth)))
+        );
+    }
+
+    /// @dev Amounts above int256 max would flip into an exact-output swap (V3) or overflow the negation (V4).
+    function test_hopAmountAboveInt256MaxIsRejected() public {
+        address pool3 = _v3Pool(address(weth), address(tka), TICK_2992, LIQUIDITY, WIDTH);
+        IPoolManagerHelper.PoolKey memory key = _v4Pool(address(weth), address(tka), TICK_2992, LIQUIDITY);
+        address pool2 = _v2Pool(tka, 2_700_000 ether, address(weth), 1000 ether);
+        Executor.Hop memory back = _v2Hop(pool2, address(tka), address(weth));
+        uint256 tooMuch = uint256(type(int256).max) + 1;
+
+        vm.prank(operator);
+        vm.expectRevert(Executor.BadRoute.selector);
+        executor.run(address(weth), tooMuch, 0, _route(_v3Hop(pool3, address(weth), address(tka)), back));
+        vm.prank(operator);
+        vm.expectRevert(Executor.BadRoute.selector);
+        executor.run(address(weth), tooMuch, 0, _route(_v4Hop(key, address(weth), address(tka), 0), back));
+    }
+
+    /// @dev An earlier hop's pool cannot collect during a later hop.
+    function test_v3CallbackRejectsOtherHopsPool() public {
+        EvilV3Pool first = new EvilV3Pool();
+        first.configure(1 ether, 1, 3000 ether);
+        CrossHopV3Pool second = new CrossHopV3Pool(first);
+        tka.mint(address(executor), 3000 ether); // so the second hop has something worth stealing
+
+        vm.prank(operator);
+        vm.expectRevert(Executor.Unauthorized.selector);
+        executor.run(
+            address(weth),
+            1 ether,
+            0,
+            _route(
+                _v3Hop(address(first), address(weth), address(tka)),
+                _v3Hop(address(second), address(tka), address(weth))
+            )
+        );
+    }
+
+    /// @dev The PancakeSwap V3 callback name pays exactly like the Uniswap one.
+    function test_pancakeV3CallbackPaysThePool() public {
+        PancakeStylePool pancake = new PancakeStylePool(address(weth), address(tka), 3000);
+        tka.mint(address(pancake), 1_000_000 ether);
+        address pool2 = _v2Pool(tka, 2_700_000 ether, address(weth), 1000 ether);
+        uint256 amountIn = 2 ether;
+        uint256 out = _v2Out(pool2, address(tka), address(weth), amountIn * 3000);
+
+        uint256 before = weth.balanceOf(address(executor));
+        uint256 profit = _run(
+            amountIn,
+            _route(_v3Hop(address(pancake), address(weth), address(tka)), _v2Hop(pool2, address(tka), address(weth)))
+        );
+        assertEq(profit, out - amountIn);
+        assertEq(weth.balanceOf(address(pancake)), amountIn, "paid through pancakeV3SwapCallback");
+        _assertClean(before, profit);
+    }
+
+    /// @dev A hook re-entering the executor mid-swap is refused on every callback, and the run still lands.
+    function test_v4HookCannotReenterExecutor() public {
+        // Hook permissions live in the address: BEFORE_SWAP (1 << 7) only.
+        address hook = address(uint160(0xBEEF) << 144 | 0x80);
+        vm.etch(hook, address(new ReentrantHook(address(executor))).code);
+        IPoolManagerHelper.PoolKey memory key = _key(address(weth), address(tka), hook);
+        int24 tick = address(weth) < address(tka) ? TICK_2992 : -TICK_2992;
+        IPoolManagerInit(manager).initialize(key, TickMath.getSqrtPriceAtTick(tick));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        v4.modifyLiquidity(key, tick - WIDTH, tick + WIDTH, int256(uint256(LIQUIDITY)));
+        address pool2 = _v2Pool(tka, 2_700_000 ether, address(weth), 1000 ether);
+        uint256 amountIn = 2 ether;
+
+        uint256 snap = vm.snapshotState();
+        uint256 mid = v4.swapExactIn(key, address(weth) < address(tka), amountIn, address(this));
+        uint256 out = _v2Out(pool2, address(tka), address(weth), mid);
+        vm.revertToState(snap);
+
+        uint256 before = weth.balanceOf(address(executor));
+        uint256 profit = _run(
+            amountIn, _route(_v4Hop(key, address(weth), address(tka), 0), _v2Hop(pool2, address(tka), address(weth)))
+        );
+        assertEq(profit, out - amountIn);
+        _assertClean(before, profit);
+        assertEq(ReentrantHook(hook).unlockCallbackError(), Executor.Unauthorized.selector);
+        assertEq(ReentrantHook(hook).v3CallbackError(), Executor.Unauthorized.selector);
+        assertEq(ReentrantHook(hook).pancakeCallbackError(), Executor.Unauthorized.selector);
+    }
+
+    /// @dev A native-input V4 hop that runs out of liquidity pays (and unwraps) only what the pool used; the
+    ///      rest stays as WETH and the profit is the real balance change.
+    function test_v4NativeInputPartialFill() public {
+        IPoolManagerHelper.PoolKey memory key = _v4Pool(address(0), address(tka), TICK_2992, 1e20);
+        address pool2 = _v2Pool(tka, 1_500_000 ether, address(weth), 1000 ether);
+        uint256 amountIn = 2 ether;
+
+        uint256 snap = vm.snapshotState();
+        uint256 ethBefore = address(v4).balance;
+        uint256 mid = v4.swapExactIn(key, true, amountIn, address(this));
+        uint256 spent = ethBefore - address(v4).balance;
+        uint256 out = _v2Out(pool2, address(tka), address(weth), mid);
+        vm.revertToState(snap);
+        assertLt(spent, amountIn, "the pool ran out of liquidity");
+        assertGt(out, spent);
+
+        uint256 wethEthBefore = address(weth).balance;
+        uint256 before = weth.balanceOf(address(executor));
+        uint256 profit = _run(
+            amountIn, _route(_v4Hop(key, address(weth), address(tka), 1), _v2Hop(pool2, address(tka), address(weth)))
+        );
+        assertEq(profit, out - spent);
+        _assertClean(before, profit);
+        assertEq(address(weth).balance, wethEthBefore - spent, "only the used input was unwrapped");
     }
 
     // ---------------------------------------------------------------- fuzz
