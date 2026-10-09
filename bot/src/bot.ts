@@ -23,8 +23,16 @@ import { getLogs } from "./rpc.js";
 import { findOpportunities, selectNonOverlapping } from "./strategy.js";
 import type { ClPool, Cycle, Opportunity } from "./types.js";
 
-/** Simulation failures (other than "no longer profitable") before a route is ignored for good. */
+/** Simulation reverts (other than "no longer profitable") before a route is set aside. */
 const MAX_ROUTE_FAILURES = 3;
+/**
+ * "Not profitable" simulations in a row before a route is set aside. The local quote is exact, so a
+ * route it keeps calling profitable that keeps failing is broken (e.g. a fee-on-transfer token the
+ * executor's balance checks reject), not just losing races.
+ */
+const MAX_ROUTE_LOST_RACES = 6;
+/** Set-aside routes are retried after this many blocks (~1h on Base), in case the cause went away. */
+const ROUTE_BLOCK_TTL_BLOCKS = 1800n;
 /** Blocks after which a pool locked by an in-flight trade is released even without a receipt. */
 const PENDING_TTL_BLOCKS = 15n;
 const REDISCOVER_EVERY_BLOCKS = 900;
@@ -63,8 +71,9 @@ export class ArbBot {
   private blocksSinceDiscovery = 0;
   private readonly untrackedActivity = new Map<Hex, number>();
   private readonly pending = new Map<Hex, bigint>();
-  private readonly routeFailures = new Map<string, number>();
-  private readonly blockedRoutes = new Set<string>();
+  private readonly routeFailures = new Map<string, { reverts: number; lostRaces: number }>();
+  /** Route key -> block after which it may be tried again. */
+  private readonly blockedRoutes = new Map<string, bigint>();
   private readonly inflight = new Set<Promise<unknown>>();
   /** "tx:pool" liquidity deltas already applied from a flashblock, so the sealed block doesn't apply them twice. */
   private readonly appliedDeltas = new Map<string, bigint>();
@@ -285,7 +294,15 @@ export class ArbBot {
     await this.rebuild();
   }
 
-  private skip = (cycle: Cycle): boolean => this.blockedRoutes.size > 0 && this.blockedRoutes.has(routeKey(cycle));
+  private skip = (cycle: Cycle): boolean => {
+    if (this.blockedRoutes.size === 0) return false;
+    const key = routeKey(cycle);
+    const until = this.blockedRoutes.get(key);
+    if (until === undefined) return false;
+    if (this.lastBlock < until) return true;
+    this.blockedRoutes.delete(key);
+    return false;
+  };
 
   private async act(cycles: Cycle[], capital: bigint, baseFee: bigint, head: bigint): Promise<Evaluated[]> {
     const opps = findOpportunities(cycles, capital, 0n, this.skip);
@@ -317,10 +334,11 @@ export class ArbBot {
     this.stats.simulated++;
     const [sim, l1Fee] = await Promise.all([this.engine.simulate(opp), this.engine.l1Fee(calldata)]);
     if (!sim.ok) {
-      if (!sim.benign) this.noteRouteFailure(opp.cycle, sim.reason);
+      this.noteRouteFailure(opp.cycle, sim.reason, sim.benign);
       log.debug("simulation rejected route", { route, reason: sim.reason });
       return undefined;
     }
+    this.routeFailures.delete(routeKey(opp.cycle));
     const costs = planCosts(sim.profit, sim.gas, baseFee, l1Fee, this.cfg.bidBps);
     if (costs.net < this.cfg.minProfitWei) {
       log.debug("below profit floor after costs", { route, gross: formatEther(sim.profit), net: formatEther(costs.net) });
@@ -378,16 +396,19 @@ export class ArbBot {
   }
 
   /**
-   * A route that keeps failing simulation for a reason other than "not profitable anymore" is broken
-   * (fee-on-transfer token, paused pool, fee higher than configured). Stop wasting calls on it.
+   * A route that keeps failing simulation is broken (fee-on-transfer token, paused pool, fee higher
+   * than configured) and would otherwise take a candidate slot every block. Set it aside for a while.
    */
-  private noteRouteFailure(cycle: Cycle, reason: string): void {
+  private noteRouteFailure(cycle: Cycle, reason: string, lostRace: boolean): void {
     const key = routeKey(cycle);
-    const failures = (this.routeFailures.get(key) ?? 0) + 1;
-    this.routeFailures.set(key, failures);
-    if (failures >= MAX_ROUTE_FAILURES) {
-      this.blockedRoutes.add(key);
-      log.warn("route blocked after repeated simulation failures", { route: this.describe(cycle), reason });
+    const counts = this.routeFailures.get(key) ?? { reverts: 0, lostRaces: 0 };
+    if (lostRace) counts.lostRaces++;
+    else counts.reverts++;
+    this.routeFailures.set(key, counts);
+    if (counts.reverts >= MAX_ROUTE_FAILURES || counts.lostRaces >= MAX_ROUTE_LOST_RACES) {
+      this.routeFailures.delete(key);
+      this.blockedRoutes.set(key, this.lastBlock + ROUTE_BLOCK_TTL_BLOCKS);
+      log.warn("route set aside after repeated simulation failures", { route: this.describe(cycle), reason, blocks: ROUTE_BLOCK_TTL_BLOCKS });
     }
   }
 
