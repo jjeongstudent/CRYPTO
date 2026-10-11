@@ -113,6 +113,7 @@ async function check(cfg: BotConfig, client: PublicClient, operator?: Address): 
     console.log(`             poolManager=${poolManager} weth=${weth}`);
     const v4 = poolManagerOf(cfg);
     if (v4 && poolManager.toLowerCase() !== v4) console.log("             WARN executor's poolManager differs from the configured V4 PoolManager; V4 routes will revert");
+    if (weth.toLowerCase() !== cfg.weth) console.log("             WARN executor's WETH differs from the bot's; native-ETH V4 routes will revert");
     console.log(`inventory    ${formatEther(balance)} WETH in executor`);
   } else {
     console.log("executor     not configured (scan/run will paper-trade with estimated gas)");

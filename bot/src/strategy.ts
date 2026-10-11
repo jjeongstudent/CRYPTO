@@ -11,19 +11,28 @@ export function evaluateCycle(cycle: Cycle, maxIn: bigint): Opportunity | null {
 /**
  * Evaluates cycles and returns the profitable ones, best first. A float check of the route's
  * marginal price (does an infinitesimal trade gain anything?) rejects the vast majority of
- * cycles before any exact bigint math runs.
+ * cycles before any exact bigint math runs. The exact math throws where the pool would revert
+ * (e.g. local state that went inconsistent); such a cycle is skipped and reported through
+ * `onError` instead of aborting the whole scan.
  */
 export function findOpportunities(
   cycles: Iterable<Cycle>,
   maxIn: bigint,
   minGrossProfit: bigint,
   skip?: (cycle: Cycle) => boolean,
+  onError?: (cycle: Cycle, err: unknown) => void,
 ): Opportunity[] {
   const found: Opportunity[] = [];
   for (const cycle of cycles) {
     if (skip?.(cycle)) continue;
     if (!(routeMarginalRate(cycle.hops) > 1)) continue;
-    const opp = evaluateCycle(cycle, maxIn);
+    let opp: Opportunity | null;
+    try {
+      opp = evaluateCycle(cycle, maxIn);
+    } catch (err) {
+      onError?.(cycle, err);
+      continue;
+    }
     if (opp && opp.grossProfit > minGrossProfit) found.push(opp);
   }
   return found.sort((a, b) => (b.grossProfit > a.grossProfit ? 1 : b.grossProfit < a.grossProfit ? -1 : 0));

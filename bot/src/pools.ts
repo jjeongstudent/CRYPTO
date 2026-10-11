@@ -4,6 +4,7 @@ import { Q96 } from "./clmath.js";
 import {
   type V4KeyBasic,
   candidateV4Keys,
+  clPoolAbi,
   loadTickWindows,
   loadV3StylePools,
   loadV4Pools,
@@ -199,6 +200,39 @@ export async function refreshAll(client: PublicClient, cfg: BotConfig, registry:
   });
   if (cl.length) await loadTickWindows(client, cl, cfg.clRangePct, poolManager);
   return changed;
+}
+
+/**
+ * Re-reads the current swap fee of pools whose fee moves with the market. Aerodrome Slipstream's
+ * dynamic fee module charges a base fee plus a term proportional to how far the price is from its
+ * TWAP (slipstream contracts/core/fees/DynamicSwapFeeModule.sol), so it rises exactly when a large
+ * swap opens an arbitrage. Returns the ids whose fee changed.
+ */
+export async function refreshDynamicFees(client: PublicClient, pools: ClPool[]): Promise<Set<Hex>> {
+  const fees = await multiread<number>(
+    client,
+    pools.map((p) => ({ address: p.id as Address, abi: clPoolAbi, functionName: "fee" })),
+  );
+  const changed = new Set<Hex>();
+  pools.forEach((pool, i) => {
+    const fee = fees[i];
+    if (fee === undefined || Number(fee) >= 1_000_000 || Number(fee) === pool.state.fee) return;
+    pool.state.fee = Number(fee);
+    changed.add(pool.id);
+  });
+  return changed;
+}
+
+/** Re-reads the full state (slot0, liquidity, fee, tick window) of specific concentrated pools. */
+export async function refreshClPools(client: PublicClient, cfg: BotConfig, pools: ClPool[]): Promise<void> {
+  const v3 = pools.filter((p) => !p.v4);
+  const v4 = pools.filter((p) => p.v4);
+  const poolManager = poolManagerOf(cfg);
+  await Promise.all([
+    v3.length ? refreshV3StylePools(client, v3) : undefined,
+    v4.length && poolManager ? refreshV4Pools(client, poolManager, v4) : undefined,
+  ]);
+  await loadTickWindows(client, pools, cfg.clRangePct, poolManager);
 }
 
 /** Counts swap/sync events per pool (address, or V4 pool id) over the last `cfg.discoverBlocks` blocks. */

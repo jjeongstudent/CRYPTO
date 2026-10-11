@@ -549,4 +549,40 @@ describe.skipIf(!anvilAvailable)("e2e with real Uniswap V3 + V4", () => {
     const minted = (x: ClPool) => x.state.ticks.find((tk) => tk.tick === align(t, 10) - 500);
     expect(minted(v3)).toEqual(minted(truth));
   });
+
+  it("repairs a pool whose local state went inconsistent instead of stalling every scan", async () => {
+    const bot = new ArbBot(client, config(), operator);
+    await bot.init();
+    const v3 = bot.registry.get(v3WethUsdc.toLowerCase() as Hex) as ClPool;
+    const wethIs0 = v3.token0 === weth.toLowerCase();
+    await write(v3h, A.v3Helper.abi, "swapExactIn", [v3WethUsdc, wethIs0, parseEther("25"), whale.address]);
+    // Leave the kind of inconsistency a missed Burn would: phantom initialized ticks right on both
+    // sides of the price whose liquidityNet contradicts the active liquidity. Any quote through the
+    // pool now has to cross one, and crossing it takes liquidity negative, so the quote throws.
+    const [, tickNow] = await read<readonly [bigint, number]>(v3WethUsdc, A.v3Pool.abi, "slot0");
+    const below = align(tickNow, 10);
+    const phantoms = new Set([below, below + 10]);
+    v3.state.ticks = [
+      ...v3.state.ticks.filter((tk) => !phantoms.has(tk.tick)),
+      { tick: below, liquidityGross: 1n, liquidityNet: 10n ** 30n },
+      { tick: below + 10, liquidityGross: 1n, liquidityNet: -(10n ** 30n) },
+    ].sort((a, b) => a.tick - b.tick);
+
+    // The scan must not throw, and nothing may be traded on the broken pool's state.
+    const first = await bot.processBlock(await head());
+    await bot.drain();
+    expect(first.every((tr) => tr.opp.cycle.hops.every((h) => h.pool !== v3))).toBe(true);
+    // ...and the pool was re-read from chain right after: the phantoms are gone.
+    const fresh = new ArbBot(client, config({ dryRun: true }), operator);
+    await fresh.init();
+    expect(v3.state.ticks).toEqual((fresh.registry.get(v3.id) as ClPool).state.ticks);
+    expect(v3.state.ticks.some((tk) => tk.liquidityGross === 1n)).toBe(false);
+
+    expect(bot.stats.quoteErrors).toBeGreaterThan(0);
+    // With state repaired, the next block re-evaluates the pool and trades through it normally.
+    await test.mine({ blocks: 1 });
+    const later = await runUntilQuiet(bot);
+    expect([...first, ...later].some((t) => t.opp.cycle.hops.some((h) => h.pool === v3))).toBe(true);
+    for (const t of later) expect(t.simulatedProfit).toBe(t.opp.grossProfit);
+  });
 });

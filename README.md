@@ -24,13 +24,14 @@ it, instead of waiting for the 2s block, and gets its own trade into the next fl
 
 ## What you can lose (and what you can't)
 
-The executor contract is built so that **a trade can never reduce its WETH balance**. Every route
-starts and ends in WETH, and the contract reverts unless its balance went up by at least
-`minProfit`. It never grants token approvals. Swap callbacks (V3 pools, the V4 PoolManager) are
-honoured only from the exact pool the current hop is calling, at most once, for at most the amount
-routed into that hop. Even a **stolen operator key cannot drain the inventory**. Only the separate
-owner key can withdraw, and there are tests that prove it, including attempts through fake V3
-pools, malicious callbacks and fake V4 hooks.
+The executor contract is built so that **a trade can never reduce its balance of any token it
+spends**. Every route starts and ends in WETH, and the contract reverts unless its WETH went up by at
+least `minProfit` and no other token it touched went down. It never grants token approvals. Swap
+callbacks (V3 pools, the V4 PoolManager) are honoured only from the exact pool the current hop is
+calling, at most once, for at most the amount routed into that hop. Even a **stolen operator key
+cannot drain the inventory**. Only the separate owner key can withdraw, and there are tests that
+prove it, including drain attempts through fake V2 pairs and V3 pools, malicious callbacks, fake V4
+hooks, and a route that starts from a worthless token to sneak WETH out mid-route.
 
 What you *can* lose is **gas on transactions that revert** (when another bot wins the race between
 simulation and inclusion) and the opportunity cost of the WETH sitting in the contract. The bot
@@ -61,6 +62,10 @@ npm start       # watches every block, logs PAPER opportunities to logs/trades.j
 ```
 
 Let it run for a few hours. `logs/trades.jsonl` shows what it would have made after gas.
+
+Startup scans the last `DISCOVER_BLOCKS` (~30 minutes) of swaps to find active tokens, then loads
+every pool and its ticks. On a rate-limited RPC this can take a minute or two; lower
+`DISCOVER_BLOCKS` or `MAX_SPOKES` to start faster.
 
 ### 2. Deploy the executor
 
@@ -116,8 +121,9 @@ subscription. `FLASHBLOCKS_WS` is still supported for streams that carry receipt
 the stream it's given doesn't.
 
 For the last few milliseconds, `SKIP_SIMULATION=true` sends straight from the local quote, which
-reproduces every supported pool exactly. A lost race then costs a reverted transaction's gas instead of
-a missed opportunity.
+reproduces every supported pool exactly given up-to-date state. Slipstream's dynamic fee is only
+re-read once per block, so a flashblock that moves it can make a trade revert. A lost race or stale
+state then costs a reverted transaction's gas instead of a missed opportunity.
 
 ## Tuning for profit
 
@@ -165,27 +171,42 @@ every flashblock (~200ms, FLASHBLOCKS_RPC_WS)         every sealed block (~2s, a
 - **Uniswap V4** state is read straight from the PoolManager's storage (`extsload`), so no extra
   contract is trusted. Native-ETH pools are routed through WETH, and the executor unwraps and
   re-wraps around the PoolManager. Only hookless pools (and hooks you allow) are traded.
-- **Aerodrome Slipstream** fees are dynamic, so they're re-read on every resync, and the on-chain
+- **Aerodrome Slipstream** fees are dynamic: base fee plus a surcharge that grows with the distance
+  between the price and its TWAP, so it rises exactly when a big swap opens an arbitrage. The bot
+  re-reads them every block (in parallel with the log fetch, so no added latency), and the on-chain
   simulation is the final word before anything is sent.
 - The executor recomputes each V2 hop from live reserves and lets V3/V4 pools compute their own
   outputs, so a small price move between simulation and inclusion just shrinks the profit instead of
   reverting the trade.
-- Routes that keep failing simulation (fee-on-transfer tokens, paused pools) are blocked automatically.
+- Routes that keep failing simulation (fee-on-transfer tokens, paused pools) are set aside for about
+  an hour, so a broken route can't hold a candidate slot every block.
+- If a pool's local state ever disagrees with the chain (say a missed event makes the exact math fail),
+  that route is skipped and the pool is re-read from chain right after the current trades, instead
+  of stalling the scan.
 - Every pool is fully re-read every `RESYNC_EVERY_BLOCKS` as a safety net, and newly active tokens
   and V4 pools are folded in every ~30 minutes.
 
 ## Tests
 
 ```bash
-cd contracts && forge test     # 10 tests incl. 2,000-run fuzz: executor == off-chain quote, or reverts
-cd bot && npm test             # 21 tests: math vs brute force, cycle graph, encoding, and end-to-end
+cd contracts && forge build && forge test   # 34 tests against the real Uniswap V3 factory/pools and V4 PoolManager
+cd bot && npm test                          # 119 tests (needs anvil and the compiled contracts)
 ```
 
-The **end-to-end suite** starts a local chain (anvil) and deploys the real compiled executor alongside
-mock Uniswap-V2-style and Aerodrome-style DEXes. A whale trade knocks prices out of line, and the test
-checks that the bot finds, simulates, sends and lands the arbitrage, and that WETH actually increases. It
-also covers 3-hop routes through a token the bot discovered itself, dry-run never sending, capital caps,
-and a wrong key being rejected.
+- **Executor:** V2, V3 and V4 hops (including native ETH), every callback and drain attack the
+  reviewers could think of, and two 2,000-run fuzz suites checking that the executor's profit equals
+  independently measured swap outputs or it reverts.
+- **Math parity:** the TypeScript tick math is compared with the real Uniswap V3 contracts on
+  thousands of ticks, prices and swap steps, plus 960 full swaps crossing over 10,000 ticks, all exact.
+- **Unit:** route sizing against brute force (including liquidity gaps and dust ranges), event
+  decoding for every venue, Flashblocks parsing against node-reth's real wire format, the
+  `pendingLogs` client, cost/bid planning and route set-aside.
+- **End-to-end** (anvil, real contracts): the bot finds, simulates, sends and lands arbitrage across
+  V2, V3 and V4 (native-ETH) pools. Predicted profit equals the on-chain simulation to the wei, and
+  realized PnL equals the executor's actual WETH change. Also covered: trading on Flashblocks and
+  `pendingLogs` before the block seals without double-applying liquidity changes, following
+  Mint/Burn/ModifyLiquidity to exactly the chain's state, repairing a pool with corrupted local
+  state, dry-run never sending, capital caps, and a wrong key being rejected.
 
 ## Making it more profitable (roadmap, highest impact first)
 

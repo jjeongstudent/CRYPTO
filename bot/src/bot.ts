@@ -17,9 +17,12 @@ import {
   rankActiveTokens,
   recentPoolActivity,
   refreshAll,
+  refreshClPools,
+  refreshDynamicFees,
   topTokens,
 } from "./pools.js";
 import { getLogs } from "./rpc.js";
+import { PoolStateError } from "./quote.js";
 import { findOpportunities, selectNonOverlapping } from "./strategy.js";
 import type { ClPool, Cycle, Opportunity } from "./types.js";
 
@@ -43,6 +46,8 @@ export interface Stats {
   blocks: number;
   flashblocks: number;
   opportunities: number;
+  /** Quotes that threw because local pool state disagreed with the chain (pool then re-read). */
+  quoteErrors: number;
   simulated: number;
   sent: number;
   landed: number;
@@ -62,7 +67,7 @@ export class ArbBot {
   index = new CycleIndex([]);
   symbols = new Map<Address, string>();
   lastBlock = 0n;
-  readonly stats: Stats = { blocks: 0, flashblocks: 0, opportunities: 0, simulated: 0, sent: 0, landed: 0, reverted: 0, realizedNetWei: 0n };
+  readonly stats: Stats = { blocks: 0, flashblocks: 0, opportunities: 0, quoteErrors: 0, simulated: 0, sent: 0, landed: 0, reverted: 0, realizedNetWei: 0n };
   readonly engine: ExecutionEngine;
 
   private spokes: Address[] = [];
@@ -81,6 +86,8 @@ export class ArbBot {
   private readonly staleWindows = new Set<ClPool>();
   /** Pools to re-evaluate on the next event even if nothing changed (e.g. a window was just reloaded). */
   private readonly dirty = new Set<Hex>();
+  /** Concentrated pools whose quote threw (local state inconsistent with the chain): re-read in full. */
+  private readonly brokenPools = new Set<ClPool>();
   private lastBaseFee = 0n;
   private lastCapital = 0n;
   private queue: Promise<unknown> = Promise.resolve();
@@ -127,6 +134,7 @@ export class ArbBot {
       (fresh) => new Map([...this.symbols, ...fresh]),
     );
     this.staleWindows.clear();
+    this.brokenPools.clear();
     this.scannedAll = false;
     const byDex: Record<string, number> = {};
     for (const p of this.registry.all()) byDex[p.dex] = (byDex[p.dex] ?? 0) + 1;
@@ -166,12 +174,16 @@ export class ArbBot {
 
   private async onBlock(head: bigint): Promise<Evaluated[]> {
     if (head <= this.lastBlock) return [];
-    const [logs, block, capital] = await Promise.all([
+    // Dynamic fees are read alongside the logs: same round-trip, no added latency.
+    const dynamic = this.registry.all().filter((p): p is ClPool => p.kind === "slipstream");
+    const [logs, block, capital, feeChanged] = await Promise.all([
       getLogs(this.client, ALL_TOPICS, this.lastBlock + 1n, head),
       this.client.getBlock({ blockNumber: head }),
       this.capital(),
+      dynamic.length ? refreshDynamicFees(this.client, dynamic).catch(() => new Set<Hex>()) : new Set<Hex>(),
     ]);
     const { changed, mustReload } = this.applyLogs(logs, head);
+    for (const id of feeChanged) changed.add(id);
     this.lastBlock = head;
     this.lastBaseFee = block.baseFeePerGas ?? 0n;
     this.lastCapital = capital;
@@ -259,8 +271,22 @@ export class ArbBot {
     return this.act(cycles, capital, baseFee, head);
   }
 
-  /** Re-centres tick windows that the price has drifted towards. Done after trading to keep it off the hot path. */
+  /** Re-reads pools whose quotes threw, then re-centres drifting tick windows. Done after trading, off the hot path. */
   private async reloadStaleWindows(): Promise<void> {
+    if (this.brokenPools.size > 0) {
+      const broken = [...this.brokenPools].filter((p) => this.registry.get(p.id) === p);
+      this.brokenPools.clear();
+      try {
+        await refreshClPools(this.client, this.cfg, broken);
+        for (const p of broken) {
+          this.staleWindows.delete(p);
+          this.dirty.add(p.id);
+        }
+      } catch (err) {
+        log.warn("pool refresh failed", { pools: broken.length, error: shortError(err) });
+        for (const p of broken) this.brokenPools.add(p);
+      }
+    }
     if (this.staleWindows.size === 0) return;
     const pools = [...this.staleWindows].filter((p) => this.registry.get(p.id) === p);
     this.staleWindows.clear();
@@ -304,8 +330,20 @@ export class ArbBot {
     return false;
   };
 
+  /** A quote threw: the local state of the route's concentrated pools disagrees with the chain. */
+  private onQuoteError = (cycle: Cycle, err: unknown): void => {
+    this.stats.quoteErrors++;
+    // Re-read the pool that failed; if the error doesn't say which, every concentrated pool on the route.
+    const suspects = err instanceof PoolStateError ? [err.pool] : cycle.hops.flatMap((h) => (h.pool.family === "cl" ? [h.pool] : []));
+    for (const pool of suspects) {
+      if (this.brokenPools.has(pool)) continue;
+      this.brokenPools.add(pool);
+      log.warn("pool state inconsistent; re-reading it from chain", { pool: pool.id, dex: pool.dex, error: shortError(err) });
+    }
+  };
+
   private async act(cycles: Cycle[], capital: bigint, baseFee: bigint, head: bigint): Promise<Evaluated[]> {
-    const opps = findOpportunities(cycles, capital, 0n, this.skip);
+    const opps = findOpportunities(cycles, capital, 0n, this.skip, this.onQuoteError);
     if (opps.length === 0) return [];
     this.stats.opportunities += opps.length;
     // Over-select (some candidates will fail simulation or the profit floor) and price them all in
@@ -423,7 +461,7 @@ export class ArbBot {
   /** Evaluates every cycle once against current state, without trading. */
   async scan(limit = 20): Promise<Evaluated[]> {
     const [capital, block] = await Promise.all([this.capital(), this.client.getBlock()]);
-    const opps = selectNonOverlapping(findOpportunities(this.index.cycles, capital, 0n, this.skip), limit);
+    const opps = selectNonOverlapping(findOpportunities(this.index.cycles, capital, 0n, this.skip, this.onQuoteError), limit);
     const results = await Promise.all(opps.map((opp) => this.evaluate(opp, block.baseFeePerGas ?? 0n)));
     return results.filter((ev): ev is Evaluated => ev !== undefined).sort(byNetDescending);
   }

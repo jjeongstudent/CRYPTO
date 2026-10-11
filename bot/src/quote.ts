@@ -1,5 +1,5 @@
-import { Q96, quoteExactInput } from "./clmath.js";
-import { type HopReserves, type Trade, bestTrade, getAmountOut, optimalAmountIn, routeCurve } from "./math.js";
+import { quoteExactInput } from "./clmath.js";
+import { type HopReserves, type Trade, bestTrade, getAmountOut } from "./math.js";
 import type { ClPool, Hop } from "./types.js";
 
 const PIPS = 1_000_000;
@@ -18,6 +18,19 @@ export function clSwapFee(pool: ClPool, zeroForOne: boolean): number {
   return protocol + v4.lpFee - Math.floor((protocol * v4.lpFee) / PIPS);
 }
 
+/**
+ * A concentrated pool's local state made the exact math fail where the real pool could not (e.g. a
+ * tick crossing that takes liquidity negative): the state disagrees with the chain.
+ */
+export class PoolStateError extends Error {
+  constructor(
+    readonly pool: ClPool,
+    cause: unknown,
+  ) {
+    super(`inconsistent state in pool ${pool.id}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+  }
+}
+
 /** Exact output of one hop for `amountIn`, matching the on-chain pool. Partial fills count only what fills. */
 export function hopQuote(hop: Hop, amountIn: bigint): bigint {
   const pool = hop.pool;
@@ -29,7 +42,11 @@ export function hopQuote(hop: Hop, amountIn: bigint): bigint {
   if (amountIn <= 0n) return 0n;
   const fee = clSwapFee(pool, hop.zeroForOne);
   const state = fee === pool.state.fee ? pool.state : { ...pool.state, fee };
-  return quoteExactInput(state, hop.zeroForOne, amountIn).amountOut;
+  try {
+    return quoteExactInput(state, hop.zeroForOne, amountIn).amountOut;
+  } catch (err) {
+    throw new PoolStateError(pool, err);
+  }
 }
 
 export function routeQuote(hops: readonly Hop[], amountIn: bigint): bigint {
@@ -41,7 +58,12 @@ export function routeQuote(hops: readonly Hop[], amountIn: bigint): bigint {
   return amount;
 }
 
-/** Output per unit of input for an infinitesimal trade, fee included (float; used only as a filter). */
+/**
+ * Output per unit of input at the current price, fee included (float; used only as a filter). Prices
+ * only move against a trader, so this bounds the rate at every trade size from above: a route whose
+ * product is <= 1 can't be profitable at any size. That holds in a zero-liquidity gap too (the first
+ * wei jumps the price to the next liquidity, at a worse rate), so a gap is not a reason to reject.
+ */
 export function marginalRate(hop: Hop): number {
   const pool = hop.pool;
   if (pool.family === "cp") {
@@ -49,7 +71,7 @@ export function marginalRate(hop: Hop): number {
     if (rIn === 0n || rOut === 0n) return 0;
     return ((1 - pool.feeBps / 10_000) * Number(rOut)) / Number(rIn);
   }
-  if (pool.state.liquidity === 0n) return 0;
+  if (pool.state.sqrtPriceX96 === 0n) return 0;
   const sqrtP = Number(pool.state.sqrtPriceX96) / Q96_FLOAT;
   const price = sqrtP * sqrtP; // token1 per token0
   const keep = 1 - clSwapFee(pool, hop.zeroForOne) / PIPS;
@@ -71,46 +93,20 @@ function asReserves(hop: Hop): HopReserves | undefined {
 }
 
 /**
- * Treats each concentrated pool as the constant-product pool it behaves like inside its current
- * tick range (virtual reserves L/√P and L·√P). Exact while no tick is crossed; a seed otherwise.
- */
-function virtualReserves(hop: Hop): HopReserves | undefined {
-  const pool = hop.pool;
-  if (pool.family === "cp") return asReserves(hop);
-  const { liquidity, sqrtPriceX96 } = pool.state;
-  if (liquidity === 0n || sqrtPriceX96 === 0n) return undefined;
-  const reserve0 = (liquidity * Q96) / sqrtPriceX96;
-  const reserve1 = (liquidity * sqrtPriceX96) / Q96;
-  if (reserve0 === 0n || reserve1 === 0n) return undefined;
-  const feeBps = Math.ceil(clSwapFee(pool, hop.zeroForOne) / 100);
-  return hop.zeroForOne ? { reserveIn: reserve0, reserveOut: reserve1, feeBps } : { reserveIn: reserve1, reserveOut: reserve0, feeBps };
-}
-
-/**
  * Profit-maximising trade for a route given at most `maxIn` of capital, or null if none.
  * Constant-product-only routes use the exact closed form. Anything with a concentrated hop is
- * maximised numerically: profit(x) = out(x) - x is concave (every hop's output is concave in its
- * input), so a golden-section search on the exact quote converges to the optimum.
+ * maximised numerically: profit(x) = out(x) - x is concave (each hop's output is concave in its
+ * input, gaps included: crossing an empty range costs no input), so a golden-section search over
+ * the whole [0, maxIn] range converges to the global optimum. Narrowing the range first from the
+ * pool's current-range liquidity is not safe: thin or dust liquidity at the current price says
+ * nothing about the deep liquidity a profitable trade reaches.
  */
 export function bestRouteTrade(hops: readonly Hop[], maxIn: bigint): Trade | null {
   if (maxIn <= 0n) return null;
   const reserves = hops.map(asReserves);
   if (reserves.every((r) => r !== undefined)) return bestTrade(reserves as HopReserves[], maxIn);
   if (!(routeMarginalRate(hops) > 1)) return null;
-
-  // Seed the search window from the virtual-reserve optimum (exact while no tick is crossed), then
-  // widen it while profit is still rising at the edge, e.g. when crossing into deeper liquidity.
-  let hi = maxIn;
-  const virtual = hops.map(virtualReserves);
-  if (virtual.every((r) => r !== undefined)) {
-    const seed = optimalAmountIn(routeCurve(virtual as HopReserves[]));
-    if (seed > 0n && seed * 4n < hi) {
-      hi = seed * 4n;
-      const profit = (x: bigint) => routeQuote(hops, x) - x;
-      while (hi < maxIn && profit(hi) > profit(hi - hi / 64n)) hi = hi * 4n < maxIn ? hi * 4n : maxIn;
-    }
-  }
-  return goldenSection(hops, hi);
+  return goldenSection(hops, maxIn);
 }
 
 function goldenSection(hops: readonly Hop[], hi: bigint): Trade | null {

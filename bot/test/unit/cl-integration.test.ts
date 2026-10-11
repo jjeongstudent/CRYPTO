@@ -1,7 +1,8 @@
-import { type Address, type Hex, encodeAbiParameters, encodeEventTopics, parseAbi } from "viem";
+import { type Address, type Hex, type PublicClient, encodeAbiParameters, encodeEventTopics, parseAbi } from "viem";
 import { describe, expect, it } from "vitest";
 import { type ClState, getSqrtRatioAtTick, wordOf } from "../../src/clmath.js";
 import { decodeV4Slot0, decodeV4TickInfo, v4PoolId } from "../../src/concentrated.js";
+import { refreshDynamicFees } from "../../src/pools.js";
 import { findCycles } from "../../src/cycles.js";
 import { TOPICS, applyLog } from "../../src/events.js";
 import { bestRouteTrade, clSwapFee, routeMarginalRate, routeQuote } from "../../src/quote.js";
@@ -226,5 +227,22 @@ describe("mixed constant-product / concentrated routes", () => {
     const v2 = cp("0x00000000000000000000000000000000000000e2", W, A, 10n * E18, 20n * E18);
     const trade = bestRouteTrade(findCycles([v2, v3], W, 2).find((c) => c.hops[0]!.pool.id === v2.id)!.hops, 1000n * E18);
     if (trade) expect(trade.amountOut).toBe(trade.amountIn + trade.profit);
+  });
+});
+
+describe("dynamic fee refresh (Aerodrome Slipstream)", () => {
+  it("updates pools whose fee moved and reports only those", async () => {
+    const pools = [1, 2, 3, 4].map((n) => cl(`0x${n.toString(16).padStart(40, "0")}`, W, A, clState(0, E18, 100, 500)));
+    // Chain answers: fee went up (volatility), unchanged, call failed, nonsense value.
+    const answers = [
+      { status: "success", result: 2_150 },
+      { status: "success", result: 500 },
+      { status: "failure" },
+      { status: "success", result: 2_000_000 },
+    ];
+    const client = { multicall: async () => answers } as unknown as PublicClient;
+    const changed = await refreshDynamicFees(client, pools);
+    expect([...changed]).toEqual([pools[0]!.id]);
+    expect(pools.map((p) => p.state.fee)).toEqual([2_150, 500, 500, 500]);
   });
 });
