@@ -5,7 +5,7 @@ line with the others, the bot buys on the cheap pool and sells on the expensive 
 transaction, ending with more WETH than it started with or reverting.
 
 - **Venues:**
-  - **Concentrated liquidity** (where most Base volume trades): Uniswap V3, SushiSwap V3, PancakeSwap V3, Aerodrome Slipstream, Uniswap V4 (including native-ETH pools)
+  - **Concentrated liquidity** (where most Base volume trades): Uniswap V3, SushiSwap V3, PancakeSwap V3, Aerodrome Slipstream (all three of its factories), Uniswap V4 (including native-ETH pools)
   - **Constant product:** Uniswap V2, SushiSwap V2, PancakeSwap V2, BaseSwap, Aerodrome volatile pools
 - **Speed:** reacts to Base **Flashblocks** (200ms pre-confirmations) as well as sealed 2s blocks
 - **Routes:** 2-hop (DEX vs DEX) and 3-hop triangles (e.g. `WETH → USDC → TOKEN → WETH`), mixing any venue types
@@ -241,7 +241,8 @@ bot/src/engine.ts                   simulation, cost/bid planning, signing, PnL 
 bot/src/chains.ts                   Base addresses (tokens, DEX factories, PoolManager)
 ```
 
-Base DEX addresses come from each project's documentation, and each venue's interface (callback
-names, storage layouts, events) was checked against that project's source code. Run `npm run check`
+Uniswap, Aerodrome/Slipstream and PancakeSwap V3 addresses were checked against those projects'
+published deployment files; SushiSwap, PancakeSwap V2 and BaseSwap come from their docs. Each venue's
+interface (callback names, storage layouts, events) was checked against that project's source code. Run `npm run check`
 before trading: it confirms every venue on-chain by finding its WETH/USDC pool, and any address
 without a contract is disabled automatically.

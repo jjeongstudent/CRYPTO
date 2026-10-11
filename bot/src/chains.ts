@@ -19,10 +19,14 @@ export interface ChainPreset {
 }
 
 /**
- * Base mainnet. Addresses are from each project's docs. They could not be checked on-chain
- * from the environment this was written in, so run `npm run check` against your RPC first: it
- * confirms every factory has code and finds a WETH/USDC pool, and disables any DEX that fails.
- * Interfaces (callbacks, slot0/ticks layouts, events) were verified against each project's source.
+ * Base mainnet. Interfaces (callbacks, slot0/ticks layouts, events) were verified against each
+ * project's source. Addresses confirmed against the projects' own published deployments:
+ * Uniswap V2/V3/V4 (Uniswap/sdks sdk-core/src/addresses.ts), Aerodrome and all three Slipstream
+ * factories (aerodrome-finance/slipstream README and script/constants), PancakeSwap V3 (same
+ * deterministic factory address in every pancake-v3-contracts deployment). SushiSwap, PancakeSwap V2
+ * and BaseSwap come from their docs. Nothing could be checked on-chain from where this was written,
+ * so run `npm run check` against your RPC first: it finds a WETH/USDC pool on every venue and
+ * disables any address without a contract.
  */
 export const BASE: ChainPreset = {
   chain: base,
@@ -50,8 +54,11 @@ export const BASE: ChainPreset = {
     { name: "uniswap-v3", kind: "v3", factory: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD", feeTiers: [100, 500, 3000, 10_000] },
     { name: "sushiswap-v3", kind: "v3", factory: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", feeTiers: [100, 500, 3000, 10_000] },
     { name: "pancakeswap-v3", kind: "pancakeV3", factory: "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865", feeTiers: [100, 500, 2500, 10_000] },
-    // Tick spacings are read from the factory; fees are dynamic per pool and re-read on every resync.
-    { name: "aerodrome-slipstream", kind: "slipstream", factory: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" },
+    // Slipstream has three live CL factories, each with its own pools. Tick spacings are read from each
+    // factory; fees are dynamic per pool and re-read every block.
+    { name: "aerodrome-slipstream", kind: "slipstream", factory: "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A" }, // initial
+    { name: "aerodrome-slipstream-2", kind: "slipstream", factory: "0xaDe65c38CD4849aDBA595a4323a8C7DdfE89716a" }, // gauge caps
+    { name: "aerodrome-slipstream-3", kind: "slipstream", factory: "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef" }, // gauges v3
     {
       name: "uniswap-v4",
       kind: "v4",
