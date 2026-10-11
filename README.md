@@ -167,7 +167,9 @@ every flashblock (~200ms, FLASHBLOCKS_RPC_WS)         every sealed block (~2s, a
   simulation to the wei.
 - **Tick windows.** Each concentrated pool keeps the initialized ticks for a band of prices around the
   current one (`CL_RANGE_PCT`). Quotes never extrapolate past the band. They count only what is
-  provably there, and the band is re-centred as the price drifts.
+  provably there, and the band is re-centred once the price has used up half of it. Any re-read of a
+  pool is pinned to the exact block whose events the bot has applied, and pre-confirmed liquidity
+  changes are replayed on top, so a reload never drops or double-counts liquidity.
 - **Uniswap V4** state is read straight from the PoolManager's storage (`extsload`), so no extra
   contract is trusted. Native-ETH pools are routed through WETH, and the executor unwraps and
   re-wraps around the PoolManager. Only hookless pools (and hooks you allow) are traded.
@@ -190,7 +192,7 @@ every flashblock (~200ms, FLASHBLOCKS_RPC_WS)         every sealed block (~2s, a
 
 ```bash
 cd contracts && forge build && forge test   # 34 tests against the real Uniswap V3 factory/pools and V4 PoolManager
-cd bot && npm test                          # 119 tests (needs anvil and the compiled contracts)
+cd bot && npm test                          # 122 tests (needs anvil and the compiled contracts)
 ```
 
 - **Executor:** V2, V3 and V4 hops (including native ETH), every callback and drain attack the

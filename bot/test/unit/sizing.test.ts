@@ -1,4 +1,4 @@
-import type { Address, Hex } from "viem";
+import type { Address } from "viem";
 import { describe, expect, it } from "vitest";
 import { type ClState, type TickInfo, getSqrtRatioAtTick, wordOf } from "../../src/clmath.js";
 import { findCycles } from "../../src/cycles.js";

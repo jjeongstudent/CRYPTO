@@ -1,6 +1,6 @@
 import { type Address, type Hex, type LocalAccount, type PublicClient, formatEther } from "viem";
 import { erc20Abi, executorAbi } from "./abi.js";
-import { type V4KeyBasic, loadTickWindows, nearWindowEdge, v4PoolId } from "./concentrated.js";
+import { type V4KeyBasic, nearWindowEdge, v4PoolId } from "./concentrated.js";
 import type { BotConfig } from "./config.js";
 import { CycleIndex, findCycles } from "./cycles.js";
 import { type Costs, ExecutionEngine, type TradeRecord, encodeRun, estimateRouteGas, planCosts, shortError } from "./engine.js";
@@ -82,12 +82,13 @@ export class ArbBot {
   private readonly inflight = new Set<Promise<unknown>>();
   /** "tx:pool" liquidity deltas already applied from a flashblock, so the sealed block doesn't apply them twice. */
   private readonly appliedDeltas = new Map<string, bigint>();
-  /** Concentrated pools whose price moved near the edge of their loaded tick window. */
-  private readonly staleWindows = new Set<ClPool>();
-  /** Pools to re-evaluate on the next event even if nothing changed (e.g. a window was just reloaded). */
+  /**
+   * Concentrated pools to re-read in full: their price drifted near the edge of the loaded tick
+   * window, or a quote through them failed because local state disagreed with the chain.
+   */
+  private readonly toReload = new Set<ClPool>();
+  /** Pools to re-evaluate on the next event even if nothing changed (e.g. a pool was just reloaded). */
   private readonly dirty = new Set<Hex>();
-  /** Concentrated pools whose quote threw (local state inconsistent with the chain): re-read in full. */
-  private readonly brokenPools = new Set<ClPool>();
   private lastBaseFee = 0n;
   private lastCapital = 0n;
   private queue: Promise<unknown> = Promise.resolve();
@@ -133,8 +134,7 @@ export class ArbBot {
     this.symbols = await fetchSymbols(this.client, [...tokens].filter((t) => !this.symbols.has(t))).then(
       (fresh) => new Map([...this.symbols, ...fresh]),
     );
-    this.staleWindows.clear();
-    this.brokenPools.clear();
+    this.toReload.clear();
     this.scannedAll = false;
     const byDex: Record<string, number> = {};
     for (const p of this.registry.all()) byDex[p.dex] = (byDex[p.dex] ?? 0) + 1;
@@ -180,7 +180,7 @@ export class ArbBot {
       getLogs(this.client, ALL_TOPICS, this.lastBlock + 1n, head),
       this.client.getBlock({ blockNumber: head }),
       this.capital(),
-      dynamic.length ? refreshDynamicFees(this.client, dynamic).catch(() => new Set<Hex>()) : new Set<Hex>(),
+      dynamic.length ? refreshDynamicFees(this.client, dynamic, head).catch(() => new Set<Hex>()) : new Set<Hex>(),
     ]);
     const { changed, mustReload } = this.applyLogs(logs, head);
     for (const id of feeChanged) changed.add(id);
@@ -190,12 +190,14 @@ export class ArbBot {
     this.stats.blocks++;
     for (const [pool, sentAt] of this.pending) if (head - sentAt > PENDING_TTL_BLOCKS) this.pending.delete(pool);
     for (const [key, at] of this.appliedDeltas) if (head - at > APPLIED_DELTA_TTL_BLOCKS) this.appliedDeltas.delete(key);
-    await this.reloadWindows(mustReload);
+    await this.reloadNow(mustReload);
 
     if (++this.blocksSinceResync >= this.cfg.resyncEveryBlocks) {
       this.blocksSinceResync = 0;
-      for (const id of await refreshAll(this.client, this.cfg, this.registry)) changed.add(id);
-      this.staleWindows.clear();
+      // Everything is re-read as of `head`, which already includes every delta seen so far.
+      for (const id of await refreshAll(this.client, this.cfg, this.registry, head)) changed.add(id);
+      this.appliedDeltas.clear();
+      this.toReload.clear();
     }
     if (++this.blocksSinceDiscovery >= REDISCOVER_EVERY_BLOCKS) {
       this.blocksSinceDiscovery = 0;
@@ -203,7 +205,7 @@ export class ArbBot {
     }
 
     const accepted = await this.evaluateChanged(changed, capital, this.lastBaseFee, head);
-    await this.reloadStaleWindows();
+    await this.reloadAfterTrading();
     return accepted;
   }
 
@@ -213,9 +215,9 @@ export class ArbBot {
     this.stats.flashblocks++;
     if (fb.baseFeePerGas !== undefined) this.lastBaseFee = fb.baseFeePerGas;
     const { changed, mustReload } = this.applyLogs(fb.logs, undefined, fb.blockNumber);
-    await this.reloadWindows(mustReload);
+    await this.reloadNow(mustReload);
     const accepted = await this.evaluateChanged(changed, this.lastCapital, this.lastBaseFee, fb.blockNumber);
-    await this.reloadStaleWindows();
+    await this.reloadAfterTrading();
     return accepted;
   }
 
@@ -242,7 +244,7 @@ export class ArbBot {
         // top of the reloaded (pre-flashblock) ticks.
         if (effect.reload) mustReload.add(pool);
         else if (flashblock !== undefined && key) this.appliedDeltas.set(key, flashblock);
-        if (nearWindowEdge(pool.state)) this.staleWindows.add(pool);
+        if (nearWindowEdge(pool.state, this.cfg.clRangePct)) this.toReload.add(pool);
       } else if (effect.type === "untracked") {
         countActivity(this.untrackedActivity, entry.address, entry.topics, poolManager);
       }
@@ -250,15 +252,31 @@ export class ArbBot {
     return { changed, mustReload };
   }
 
-  /** Re-reads tick windows that local events could not keep exact. Must finish before quoting those pools. */
-  private async reloadWindows(pools: Set<ClPool>): Promise<void> {
+  /**
+   * Re-reads pools in full as of `lastBlock`, the last sealed block whose logs have been applied, so
+   * the result lines up exactly with local state. Reading "latest" instead could land on a block
+   * whose events get applied again later, or miss pre-confirmed ones. Liquidity deltas already applied
+   * from flashblocks are un-marked for these pools: the re-read state doesn't include them, so the
+   * sealed block must replay them.
+   */
+  private async reloadPools(pools: Iterable<ClPool>): Promise<void> {
+    const live = [...new Set(pools)].filter((p) => this.registry.get(p.id) === p);
+    if (live.length === 0) return;
+    await refreshClPools(this.client, this.cfg, live, this.lastBlock);
+    const suffixes = new Set(live.map((p) => `:${p.id}`));
+    for (const key of this.appliedDeltas.keys()) if (suffixes.has(key.slice(key.indexOf(":")))) this.appliedDeltas.delete(key);
+    for (const p of live) this.dirty.add(p.id);
+  }
+
+  /** Re-reads pools that local events could not keep exact. Must finish before quoting them. */
+  private async reloadNow(pools: Set<ClPool>): Promise<void> {
     if (pools.size === 0) return;
     try {
-      await loadTickWindows(this.client, [...pools], this.cfg.clRangePct, poolManagerOf(this.cfg));
+      await this.reloadPools(pools);
     } catch (err) {
-      // Leave them stale; the post-trade reload or the next resync retries.
-      log.warn("tick window reload failed", { pools: pools.size, error: shortError(err) });
-      for (const p of pools) this.staleWindows.add(p);
+      // Retried after trading, and by the next resync.
+      log.warn("pool reload failed", { pools: pools.size, error: shortError(err) });
+      for (const p of pools) this.toReload.add(p);
     }
   }
 
@@ -271,31 +289,16 @@ export class ArbBot {
     return this.act(cycles, capital, baseFee, head);
   }
 
-  /** Re-reads pools whose quotes threw, then re-centres drifting tick windows. Done after trading, off the hot path. */
-  private async reloadStaleWindows(): Promise<void> {
-    if (this.brokenPools.size > 0) {
-      const broken = [...this.brokenPools].filter((p) => this.registry.get(p.id) === p);
-      this.brokenPools.clear();
-      try {
-        await refreshClPools(this.client, this.cfg, broken);
-        for (const p of broken) {
-          this.staleWindows.delete(p);
-          this.dirty.add(p.id);
-        }
-      } catch (err) {
-        log.warn("pool refresh failed", { pools: broken.length, error: shortError(err) });
-        for (const p of broken) this.brokenPools.add(p);
-      }
-    }
-    if (this.staleWindows.size === 0) return;
-    const pools = [...this.staleWindows].filter((p) => this.registry.get(p.id) === p);
-    this.staleWindows.clear();
+  /** Re-reads pools whose quotes failed or whose window needs re-centring. Done after trading, off the hot path. */
+  private async reloadAfterTrading(): Promise<void> {
+    if (this.toReload.size === 0) return;
+    const pools = [...this.toReload];
+    this.toReload.clear();
     try {
-      await loadTickWindows(this.client, pools, this.cfg.clRangePct, poolManagerOf(this.cfg));
-      for (const p of pools) this.dirty.add(p.id);
+      await this.reloadPools(pools);
     } catch (err) {
-      log.warn("tick window reload failed", { pools: pools.length, error: shortError(err) });
-      for (const p of pools) this.staleWindows.add(p);
+      log.warn("pool reload failed", { pools: pools.length, error: shortError(err) });
+      for (const p of pools) this.toReload.add(p);
     }
   }
 
@@ -336,8 +339,8 @@ export class ArbBot {
     // Re-read the pool that failed; if the error doesn't say which, every concentrated pool on the route.
     const suspects = err instanceof PoolStateError ? [err.pool] : cycle.hops.flatMap((h) => (h.pool.family === "cl" ? [h.pool] : []));
     for (const pool of suspects) {
-      if (this.brokenPools.has(pool)) continue;
-      this.brokenPools.add(pool);
+      if (this.toReload.has(pool)) continue;
+      this.toReload.add(pool);
       log.warn("pool state inconsistent; re-reading it from chain", { pool: pool.id, dex: pool.dex, error: shortError(err) });
     }
   };

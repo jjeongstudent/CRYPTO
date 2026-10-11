@@ -174,7 +174,7 @@ export function isLiquid(pool: Pool, cfg: BotConfig): boolean {
  * Re-reads the full state of every tracked pool (reserves, slot0, liquidity, fees, tick windows).
  * Safety net against missed logs and reorgs. Returns the ids that changed.
  */
-export async function refreshAll(client: PublicClient, cfg: BotConfig, registry: PoolRegistry): Promise<Set<Hex>> {
+export async function refreshAll(client: PublicClient, cfg: BotConfig, registry: PoolRegistry, blockNumber?: bigint): Promise<Set<Hex>> {
   const pools = registry.all();
   const cp = pools.filter((p): p is CpPool => p.family === "cp");
   const cl = pools.filter((p): p is ClPool => p.family === "cl");
@@ -186,9 +186,10 @@ export async function refreshAll(client: PublicClient, cfg: BotConfig, registry:
     multiread<readonly [bigint, bigint, bigint]>(
       client,
       cp.map((p) => ({ address: p.id as Address, abi: poolAbi, functionName: "getReserves" })),
+      blockNumber,
     ),
-    v3.length ? refreshV3StylePools(client, v3) : Promise.resolve(new Set<Hex>()),
-    v4.length && poolManager ? refreshV4Pools(client, poolManager, v4) : Promise.resolve(new Set<Hex>()),
+    v3.length ? refreshV3StylePools(client, v3, blockNumber) : Promise.resolve(new Set<Hex>()),
+    v4.length && poolManager ? refreshV4Pools(client, poolManager, v4, blockNumber) : Promise.resolve(new Set<Hex>()),
   ]);
   const changed = new Set<Hex>([...v3Changed, ...v4Changed]);
   reserves.forEach((r, i) => {
@@ -198,7 +199,7 @@ export async function refreshAll(client: PublicClient, cfg: BotConfig, registry:
     pool.reserve1 = r[1];
     changed.add(pool.id);
   });
-  if (cl.length) await loadTickWindows(client, cl, cfg.clRangePct, poolManager);
+  if (cl.length) await loadTickWindows(client, cl, cfg.clRangePct, poolManager, blockNumber);
   return changed;
 }
 
@@ -208,10 +209,11 @@ export async function refreshAll(client: PublicClient, cfg: BotConfig, registry:
  * TWAP (slipstream contracts/core/fees/DynamicSwapFeeModule.sol), so it rises exactly when a large
  * swap opens an arbitrage. Returns the ids whose fee changed.
  */
-export async function refreshDynamicFees(client: PublicClient, pools: ClPool[]): Promise<Set<Hex>> {
+export async function refreshDynamicFees(client: PublicClient, pools: ClPool[], blockNumber?: bigint): Promise<Set<Hex>> {
   const fees = await multiread<number>(
     client,
     pools.map((p) => ({ address: p.id as Address, abi: clPoolAbi, functionName: "fee" })),
+    blockNumber,
   );
   const changed = new Set<Hex>();
   pools.forEach((pool, i) => {
@@ -223,16 +225,19 @@ export async function refreshDynamicFees(client: PublicClient, pools: ClPool[]):
   return changed;
 }
 
-/** Re-reads the full state (slot0, liquidity, fee, tick window) of specific concentrated pools. */
-export async function refreshClPools(client: PublicClient, cfg: BotConfig, pools: ClPool[]): Promise<void> {
+/**
+ * Re-reads the full state (slot0, liquidity, fee, tick window) of specific concentrated pools as of
+ * `blockNumber`, so the result lines up exactly with the logs the caller has applied up to that block.
+ */
+export async function refreshClPools(client: PublicClient, cfg: BotConfig, pools: ClPool[], blockNumber?: bigint): Promise<void> {
   const v3 = pools.filter((p) => !p.v4);
   const v4 = pools.filter((p) => p.v4);
   const poolManager = poolManagerOf(cfg);
   await Promise.all([
-    v3.length ? refreshV3StylePools(client, v3) : undefined,
-    v4.length && poolManager ? refreshV4Pools(client, poolManager, v4) : undefined,
+    v3.length ? refreshV3StylePools(client, v3, blockNumber) : undefined,
+    v4.length && poolManager ? refreshV4Pools(client, poolManager, v4, blockNumber) : undefined,
   ]);
-  await loadTickWindows(client, pools, cfg.clRangePct, poolManager);
+  await loadTickWindows(client, pools, cfg.clRangePct, poolManager, blockNumber);
 }
 
 /** Counts swap/sync events per pool (address, or V4 pool id) over the last `cfg.discoverBlocks` blocks. */

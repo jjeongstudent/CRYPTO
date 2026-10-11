@@ -1,7 +1,7 @@
 import { type Address, type Hex, type PublicClient, encodeAbiParameters, encodeEventTopics, parseAbi } from "viem";
 import { describe, expect, it } from "vitest";
 import { type ClState, getSqrtRatioAtTick, wordOf } from "../../src/clmath.js";
-import { decodeV4Slot0, decodeV4TickInfo, v4PoolId } from "../../src/concentrated.js";
+import { decodeV4Slot0, decodeV4TickInfo, nearWindowEdge, v4PoolId } from "../../src/concentrated.js";
 import { refreshDynamicFees } from "../../src/pools.js";
 import { findCycles } from "../../src/cycles.js";
 import { TOPICS, applyLog } from "../../src/events.js";
@@ -145,6 +145,21 @@ describe("liquidity deltas outside the loaded window", () => {
     expect(pool.state.liquidity).toBe(700n);
   });
 
+  it("apply full-range positions (both ticks outside the window) without a reload", () => {
+    const pool = cl("0x0000000000000000000000000000000000000006", W, A, clState(0, 1_000n));
+    const local = new Map<Hex, Pool>([[pool.id, pool]]);
+    const ticksBefore = pool.state.ticks.map((t) => ({ ...t }));
+    const mint = encodeEventTopics({ abi: eventsAbi, eventName: "Mint", args: { owner: W, tickLower: -887_220, tickUpper: 887_220 } }) as Hex[];
+    const mintData = encodeAbiParameters([{ type: "address" }, { type: "uint128" }, { type: "uint256" }, { type: "uint256" }], [W, 400n, 1n, 1n]);
+    expect(applyLog(local, { address: pool.id as Address, topics: mint, data: mintData }, PM)).toEqual({ type: "changed", id: pool.id, delta: true, reload: false });
+    expect(pool.state.liquidity).toBe(1_400n);
+    const burn = encodeEventTopics({ abi: eventsAbi, eventName: "Burn", args: { owner: W, tickLower: -887_220, tickUpper: 887_220 } }) as Hex[];
+    const burnData = encodeAbiParameters([{ type: "uint128" }, { type: "uint256" }, { type: "uint256" }], [150n, 1n, 1n]);
+    expect(applyLog(local, { address: pool.id as Address, topics: burn, data: burnData }, PM)).toMatchObject({ reload: false });
+    expect(pool.state.liquidity).toBe(1_250n);
+    expect(pool.state.ticks).toEqual(ticksBefore);
+  });
+
   it("request a reload when an in-window delta contradicts local ticks", () => {
     const pool = cl("0x0000000000000000000000000000000000000005", W, A, clState(0, 1_000n));
     const local = new Map<Hex, Pool>([[pool.id, pool]]);
@@ -244,5 +259,25 @@ describe("dynamic fee refresh (Aerodrome Slipstream)", () => {
     const changed = await refreshDynamicFees(client, pools);
     expect([...changed]).toEqual([pools[0]!.id]);
     expect(pools.map((p) => p.state.fee)).toEqual([2_150, 500, 500, 500]);
+  });
+});
+
+describe("tick window re-centring", () => {
+  it("leaves a centred window alone and re-centres once less than half the range is left", () => {
+    // Spacing 60: one word = 15,360 ticks, so a ±25% range (~2,232 ticks) needs one word each side.
+    const state = clState(0, E18, 60, 3000);
+    state.tick = 7_680; // middle of word 0
+    state.wordLo = -1;
+    state.wordHi = 1;
+    expect(nearWindowEdge(state, 0.25)).toBe(false);
+    state.tick = 30_720 - 2_000; // 2,000 ticks from the top edge: more than half the range (1,116) left
+    expect(nearWindowEdge(state, 0.25)).toBe(false);
+    state.tick = 30_720 - 1_000; // 1,000 ticks left: re-centre
+    expect(nearWindowEdge(state, 0.25)).toBe(true);
+    state.tick = -15_360 + 500; // near the bottom edge
+    expect(nearWindowEdge(state, 0.25)).toBe(true);
+    state.wordLo = 1;
+    state.wordHi = 0; // nothing loaded yet
+    expect(nearWindowEdge(state, 0.25)).toBe(true);
   });
 });

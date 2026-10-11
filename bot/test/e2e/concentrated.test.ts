@@ -585,4 +585,44 @@ describe.skipIf(!anvilAvailable)("e2e with real Uniswap V3 + V4", () => {
     expect([...first, ...later].some((t) => t.opp.cycle.hops.some((h) => h.pool === v3))).toBe(true);
     for (const t of later) expect(t.simulatedProfit).toBe(t.opp.grossProfit);
   });
+
+  it("stays exact when a flashblock forces a pool reload before the sealed block arrives", async () => {
+    // A position that exists before the bot starts, so it is part of the bot's loaded state.
+    const pre = await read<readonly [bigint, number]>(v3WethUsdc, A.v3Pool.abi, "slot0");
+    const t = align(pre[1], 10);
+    await write(v3h, A.v3Helper.abi, "mint", [v3WethUsdc, t - 300, t + 300, 2n * 10n ** 15n]);
+    const bot = new ArbBot(client, config({ dryRun: true }), operator);
+    await bot.init();
+    const v3 = bot.registry.get(v3WethUsdc.toLowerCase() as Hex) as ClPool;
+
+    // Two pre-confirmed transactions: a new in-window position, and a partial burn of the old one.
+    const mint = await write(v3h, A.v3Helper.abi, "mint", [v3WethUsdc, t - 200, t + 200, 3n * 10n ** 15n]);
+    const burn = await write(v3h, A.v3Helper.abi, "burn", [v3WethUsdc, t - 300, t + 300, 10n ** 15n]);
+    // As if an earlier event had been missed: the bot's copy lacks one of the burned position's ticks,
+    // so applying the Burn fails and the pool has to be re-read mid-block.
+    v3.state.ticks = v3.state.ticks.filter((tk) => tk.tick !== t - 300);
+    const logs = [mint, burn].flatMap((r) =>
+      r.logs.map((l) => ({ address: l.address.toLowerCase() as Hex, topics: l.topics as Hex[], data: l.data, transactionHash: r.transactionHash })),
+    );
+    await bot.processFlashblock({
+      blockNumber: burn.blockNumber,
+      index: 0,
+      payloadId: "0x01",
+      transactionHashes: [mint.transactionHash, burn.transactionHash],
+      logs,
+    });
+    // The sealed blocks arrive and replay whatever the reload did not already account for.
+    await bot.processBlock(await head());
+    await bot.drain();
+
+    const fresh = new ArbBot(client, config({ dryRun: true }), operator);
+    await fresh.init();
+    const truth = fresh.registry.get(v3.id) as ClPool;
+    expect(v3.state.liquidity).toBe(truth.state.liquidity);
+    expect(v3.state.sqrtPriceX96).toBe(truth.state.sqrtPriceX96);
+    const lo = Math.max(v3.state.wordLo, truth.state.wordLo);
+    const hi = Math.min(v3.state.wordHi, truth.state.wordHi);
+    const inWindow = (x: { tick: number }) => wordOf(x.tick, 10) >= lo && wordOf(x.tick, 10) <= hi;
+    expect(v3.state.ticks.filter(inWindow)).toEqual(truth.state.ticks.filter(inWindow));
+  });
 });

@@ -1,5 +1,5 @@
 import { type Address, type Hex, toEventSelector } from "viem";
-import { type ClState, applyLiquidityDelta, wordOf } from "./clmath.js";
+import { type ClState, applyLiquidityDelta } from "./clmath.js";
 import type { Pool } from "./types.js";
 
 /**
@@ -141,23 +141,21 @@ export function applyLog(pools: ReadonlyMap<Hex, Pool>, entry: LogLike, poolMana
 }
 
 /**
- * Applies a liquidity delta to local state. Ticks are only known inside the loaded window, so a
- * position reaching outside it (or one that contradicts local state) can't be applied tick by tick:
- * keep the active liquidity right and report that the window must be reloaded from chain.
+ * Applies a liquidity delta to local state. applyLiquidityDelta updates the ticks inside the loaded
+ * window and the active liquidity, and ignores ticks outside the window (only the window is ever
+ * quoted, so e.g. a full-range position needs no reload). If the delta contradicts local state (a
+ * burn of liquidity the window doesn't hold), local state is wrong: keep the active liquidity right
+ * and report that the pool must be re-read from chain.
  */
 function applyDelta(state: ClState, lower: number, upper: number, delta: bigint): boolean {
-  const known = (tick: number) => {
-    const w = wordOf(tick, state.tickSpacing);
-    return w >= state.wordLo && w <= state.wordHi;
-  };
+  const ticksBefore = state.ticks.map((t) => ({ ...t }));
   const liquidityBefore = state.liquidity;
-  if (known(lower) && known(upper)) {
-    try {
-      applyLiquidityDelta(state, lower, upper, delta);
-      return false;
-    } catch {
-      state.liquidity = liquidityBefore;
-    }
+  try {
+    applyLiquidityDelta(state, lower, upper, delta);
+    return false;
+  } catch {
+    state.ticks = ticksBefore;
+    state.liquidity = liquidityBefore;
   }
   if (lower <= state.tick && state.tick < upper && state.liquidity + delta >= 0n) state.liquidity += delta;
   return true;

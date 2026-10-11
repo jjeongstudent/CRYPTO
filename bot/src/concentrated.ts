@@ -107,27 +107,37 @@ export function decodeV4TickInfo(word: Hex): { liquidityGross: bigint; liquidity
   return { liquidityGross: v & ((1n << 128n) - 1n), liquidityNet: signed(v >> 128n, 128) };
 }
 
-async function extsload(client: PublicClient, poolManager: Address, slots: Hex[]): Promise<Hex[]> {
+async function extsload(client: PublicClient, poolManager: Address, slots: Hex[], blockNumber?: bigint): Promise<Hex[]> {
   const chunks: Hex[][] = [];
   for (let i = 0; i < slots.length; i += EXTSLOAD_CHUNK) chunks.push(slots.slice(i, i + EXTSLOAD_CHUNK));
   const results = await Promise.all(
-    chunks.map((chunk) => client.readContract({ address: poolManager, abi: poolManagerAbi, functionName: "extsload", args: [chunk] })),
+    chunks.map((chunk) => client.readContract({ address: poolManager, abi: poolManagerAbi, functionName: "extsload", args: [chunk], blockNumber })),
   );
   return results.flat() as Hex[];
 }
 
 // ---------------------------------------------------------------- tick windows
 
-/** Bitmap words on each side of the current one needed to cover a ±`rangePct` price move. */
-export function windowWords(tickSpacing: number, rangePct: number): number {
-  const ticks = Math.log(1 + rangePct) / Math.log(1.0001);
-  return Math.min(Math.max(Math.ceil(ticks / (256 * tickSpacing)), 1), 32);
+/** Ticks covering a ±`rangePct` price move. */
+function rangeTicks(rangePct: number): number {
+  return Math.log(1 + rangePct) / Math.log(1.0001);
 }
 
-/** True when the current tick is within one word of the edge of the loaded window. */
-export function nearWindowEdge(state: ClState): boolean {
-  const w = wordOf(state.tick, state.tickSpacing);
-  return w - 1 <= state.wordLo || w + 1 >= state.wordHi;
+/** Bitmap words on each side of the current one needed to cover a ±`rangePct` price move. */
+export function windowWords(tickSpacing: number, rangePct: number): number {
+  return Math.min(Math.max(Math.ceil(rangeTicks(rangePct) / (256 * tickSpacing)), 1), 32);
+}
+
+/**
+ * True when the price has drifted so far that less than half the configured range is left between
+ * it and either edge of the loaded window, i.e. it is time to re-centre the window.
+ */
+export function nearWindowEdge(state: ClState, rangePct: number): boolean {
+  if (state.wordLo > state.wordHi) return true;
+  const lowest = state.wordLo * 256 * state.tickSpacing;
+  const highest = (state.wordHi + 1) * 256 * state.tickSpacing - 1;
+  const margin = rangeTicks(rangePct) / 2;
+  return state.tick - lowest < margin || highest - state.tick < margin;
 }
 
 function initializedTicks(word: number, bitmap: bigint, tickSpacing: number): number[] {
@@ -142,7 +152,13 @@ function initializedTicks(word: number, bitmap: bigint, tickSpacing: number): nu
  * (Re)loads the initialized ticks around each pool's current price. Replaces `state.ticks` and
  * the window bounds atomically per pool, so quotes never mix old and new tick sets.
  */
-export async function loadTickWindows(client: PublicClient, pools: ClPool[], rangePct: number, poolManager?: Address): Promise<void> {
+export async function loadTickWindows(
+  client: PublicClient,
+  pools: ClPool[],
+  rangePct: number,
+  poolManager?: Address,
+  blockNumber?: bigint,
+): Promise<void> {
   const plans = pools.map((pool) => {
     const w = windowWords(pool.state.tickSpacing, rangePct);
     const center = wordOf(pool.state.tick, pool.state.tickSpacing);
@@ -157,10 +173,11 @@ export async function loadTickWindows(client: PublicClient, pools: ClPool[], ran
   const v3Bitmaps = await multiread<bigint>(
     client,
     v3Plans.flatMap((p) => p.words.map((w) => ({ address: p.pool.id as Address, abi: clPoolAbi, functionName: "tickBitmap", args: [w] }) as ReadCall)),
+    blockNumber,
   );
   const v4Bitmaps =
     v4Plans.length && poolManager
-      ? (await extsload(client, poolManager, v4Plans.flatMap((p) => p.words.map((w) => v4Slots(p.pool.id).bitmap(w))))).map(BigInt)
+      ? (await extsload(client, poolManager, v4Plans.flatMap((p) => p.words.map((w) => v4Slots(p.pool.id).bitmap(w))), blockNumber)).map(BigInt)
       : [];
 
   const tickLists = new Map<ClPool, number[]>();
@@ -181,10 +198,13 @@ export async function loadTickWindows(client: PublicClient, pools: ClPool[], ran
   const v3Infos = await multiread<readonly [bigint, bigint]>(
     client,
     v3Plans.flatMap((p) => tickLists.get(p.pool)!.map((t) => ({ address: p.pool.id as Address, abi: clPoolAbi, functionName: "ticks", args: [t] }) as ReadCall)),
+    blockNumber,
   );
   const v4Infos =
     v4Plans.length && poolManager
-      ? (await extsload(client, poolManager, v4Plans.flatMap((p) => tickLists.get(p.pool)!.map((t) => v4Slots(p.pool.id).tick(t))))).map(decodeV4TickInfo)
+      ? (await extsload(client, poolManager, v4Plans.flatMap((p) => tickLists.get(p.pool)!.map((t) => v4Slots(p.pool.id).tick(t))), blockNumber)).map(
+          decodeV4TickInfo,
+        )
       : [];
 
   let j = 0;
@@ -270,11 +290,12 @@ export async function loadV3StylePools(client: PublicClient, dex: DexConfig, pai
 }
 
 /** Re-reads slot0, liquidity and (dynamic) fee for V3-style pools. Returns ids that changed. */
-export async function refreshV3StylePools(client: PublicClient, pools: ClPool[]): Promise<Set<Hex>> {
+export async function refreshV3StylePools(client: PublicClient, pools: ClPool[], blockNumber?: bigint): Promise<Set<Hex>> {
   const fields = ["slot0", "liquidity", "fee"] as const;
   const results = await multiread<unknown>(
     client,
     pools.flatMap((p) => fields.map((functionName) => ({ address: p.id as Address, abi: clPoolAbi, functionName }) as ReadCall)),
+    blockNumber,
   );
   const changed = new Set<Hex>();
   pools.forEach((pool, i) => {
@@ -354,8 +375,8 @@ export async function loadV4Pools(client: PublicClient, dex: DexConfig, keys: V4
 }
 
 /** Re-reads slot0 and liquidity for V4 pools. Returns ids that changed. */
-export async function refreshV4Pools(client: PublicClient, poolManager: Address, pools: ClPool[]): Promise<Set<Hex>> {
-  const words = await extsload(client, poolManager, pools.flatMap((p) => [v4Slots(p.id).slot0, v4Slots(p.id).liquidity]));
+export async function refreshV4Pools(client: PublicClient, poolManager: Address, pools: ClPool[], blockNumber?: bigint): Promise<Set<Hex>> {
+  const words = await extsload(client, poolManager, pools.flatMap((p) => [v4Slots(p.id).slot0, v4Slots(p.id).liquidity]), blockNumber);
   const changed = new Set<Hex>();
   pools.forEach((pool, i) => {
     const slot0 = decodeV4Slot0(words[i * 2]!);

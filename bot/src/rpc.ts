@@ -10,14 +10,17 @@ export interface ReadCall {
   args?: readonly unknown[];
 }
 
-/** Multicall with per-call failure tolerance; failed calls come back as undefined. */
-export async function multiread<T>(client: PublicClient, calls: ReadCall[]): Promise<(T | undefined)[]> {
+/**
+ * Multicall with per-call failure tolerance; failed calls come back as undefined. `blockNumber` pins
+ * the reads to one block (default: latest).
+ */
+export async function multiread<T>(client: PublicClient, calls: ReadCall[], blockNumber?: bigint): Promise<(T | undefined)[]> {
   const chunks: ReadCall[][] = [];
   for (let i = 0; i < calls.length; i += MULTICALL_CHUNK) chunks.push(calls.slice(i, i + MULTICALL_CHUNK));
   const results = await Promise.all(
     chunks.map(
       (chunk) =>
-        client.multicall({ contracts: chunk, allowFailure: true, batchSize: 0 } as never) as Promise<
+        client.multicall({ contracts: chunk, allowFailure: true, batchSize: 0, blockNumber } as never) as Promise<
           { status: "success" | "failure"; result?: unknown }[]
         >,
     ),
