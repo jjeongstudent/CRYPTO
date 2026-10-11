@@ -19,6 +19,7 @@ import { bigintJson, log } from "./log.js";
 import { type Cycle, type Hop, type Opportunity, hopTokenIn, hopTokenOut } from "./types.js";
 
 const ZERO_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
+const L1_FEE_TTL_MS = 12_000;
 
 /** Executor.Hop.kind */
 export const HOP_V2 = 0;
@@ -132,6 +133,7 @@ export interface TradeRecord {
 
 export class ExecutionEngine {
   private nonce: number | undefined;
+  private readonly l1FeeCache = new Map<number, { fee: bigint; at: number }>();
 
   constructor(
     private readonly client: PublicClient,
@@ -173,8 +175,22 @@ export class ExecutionEngine {
     }
   }
 
+  /**
+   * L1 data fee for a transaction carrying `data`. It depends on the calldata's compressed size, which
+   * barely varies between routes with the same number of hops, and on the L1 base/blob fee, which moves
+   * once per L1 block (~12s). Estimates are therefore cached by calldata size for that long, so trading
+   * doesn't wait on an extra round-trip, even with SKIP_SIMULATION.
+   */
   async l1Fee(data: Hex): Promise<bigint> {
     if (!this.cfg.opStack) return 0n;
+    const cached = this.l1FeeCache.get(data.length);
+    if (cached && Date.now() - cached.at < L1_FEE_TTL_MS) return cached.fee;
+    const fee = await this.fetchL1Fee(data);
+    this.l1FeeCache.set(data.length, { fee, at: Date.now() });
+    return fee;
+  }
+
+  protected fetchL1Fee(data: Hex): Promise<bigint> {
     return estimateL1Fee(this.client as never, {
       account: this.from ?? ZERO_ADDRESS,
       to: this.cfg.executor ?? ZERO_ADDRESS,

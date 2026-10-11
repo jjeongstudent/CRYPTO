@@ -3,7 +3,7 @@ import { base } from "viem/chains";
 import { describe, expect, it } from "vitest";
 import { ArbBot } from "../../src/bot.js";
 import type { BotConfig } from "../../src/config.js";
-import type { SimulationResult } from "../../src/engine.js";
+import { ExecutionEngine, type SimulationResult } from "../../src/engine.js";
 import type { CpPool, Cycle, Opportunity } from "../../src/types.js";
 
 const E18 = 10n ** 18n;
@@ -88,5 +88,26 @@ describe("routes that keep failing simulation", () => {
     expect(skipped()).toBe(true);
     bot.lastBlock = 1_800n;
     expect(skipped()).toBe(false);
+  });
+});
+
+describe("L1 data fee estimates", () => {
+  it("are cached by calldata size so trading doesn't wait on a round-trip each time", async () => {
+    const calls: string[] = [];
+    class CountingEngine extends ExecutionEngine {
+      protected override async fetchL1Fee(data: `0x${string}`): Promise<bigint> {
+        calls.push(data);
+        return BigInt(data.length) * 1_000n;
+      }
+    }
+    const engine = new CountingEngine({} as PublicClient, { ...cfg, opStack: true }, "0x00000000000000000000000000000000000000f1", undefined);
+    const twoHops = `0x${"ab".repeat(100)}` as const;
+    const threeHops = `0x${"ab".repeat(130)}` as const;
+    expect(await engine.l1Fee(twoHops)).toBe(202_000n);
+    expect(await engine.l1Fee(`0x${"cd".repeat(100)}`)).toBe(202_000n); // same size: cached
+    expect(await engine.l1Fee(threeHops)).toBe(262_000n);
+    expect(calls).toHaveLength(2);
+    const plain = new CountingEngine({} as PublicClient, cfg, undefined, undefined);
+    expect(await plain.l1Fee(twoHops)).toBe(0n); // not an OP-stack chain
   });
 });

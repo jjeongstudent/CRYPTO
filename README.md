@@ -192,7 +192,7 @@ every flashblock (~200ms, FLASHBLOCKS_RPC_WS)         every sealed block (~2s, a
 
 ```bash
 cd contracts && forge build && forge test   # 34 tests against the real Uniswap V3 factory/pools and V4 PoolManager
-cd bot && npm test                          # 122 tests (needs anvil and the compiled contracts)
+cd bot && npm test                          # 123 tests (needs anvil and the compiled contracts)
 ```
 
 - **Executor:** V2, V3 and V4 hops (including native ETH), every callback and drain attack the
